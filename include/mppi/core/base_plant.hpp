@@ -41,6 +41,8 @@ public:
   using COST_PARAMS_T = typename COST_T::COST_PARAMS_T;
   using TEMPLATED_CONTROLLER = CONTROLLER_T;
   using CONTROLLER_PARAMS_T = typename CONTROLLER_T::TEMPLATED_PARAMS;
+  using SAMPLER_T = typename CONTROLLER_T::TEMPLATED_SAMPLING;
+  using SAMPLER_PARAMS_T = typename CONTROLLER_T::TEMPLATED_SAMPLING_PARAMS;
 
   // Feedback related aliases
   using FB_STATE_T = typename CONTROLLER_T::TEMPLATED_FEEDBACK::TEMPLATED_FEEDBACK_STATE;
@@ -61,10 +63,13 @@ protected:
   std::mutex cost_params_guard_;
   CONTROLLER_PARAMS_T controller_params_;
   std::mutex controller_params_guard_;
+  SAMPLER_PARAMS_T sampler_params_;
+  std::mutex sampler_params_guard_;
 
   std::atomic<bool> has_new_dynamics_params_{ false };
   std::atomic<bool> has_new_cost_params_{ false };
   std::atomic<bool> has_new_controller_params_{ false };
+  std::atomic<bool> has_new_sampler_params_{ false };
   std::atomic<bool> enabled_{ false };
 
   // Values needed
@@ -332,6 +337,10 @@ public:
   {
     return has_new_controller_params_;
   };
+  virtual bool hasNewSamplerParams()
+  {
+    return has_new_sampler_params_;
+  };
 
   virtual DYN_PARAMS_T getNewDynamicsParams(bool set_flag = false)
   {
@@ -347,6 +356,11 @@ public:
   {
     has_new_controller_params_ = set_flag;
     return controller_params_;
+  }
+  virtual SAMPLER_PARAMS_T getNewSamplerParams(bool set_flag = false)
+  {
+    has_new_sampler_params_ = set_flag;
+    return sampler_params_;
   }
 
   virtual void setDynamicsParams(const DYN_PARAMS_T& params)
@@ -366,6 +380,12 @@ public:
     std::lock_guard<std::mutex> guard(controller_params_guard_);
     controller_params_ = params;
     has_new_controller_params_ = true;
+  }
+  virtual void setSamplerParams(const SAMPLER_PARAMS_T& params)
+  {
+    std::lock_guard<std::mutex> guard(sampler_params_guard_);
+    sampler_params_ = params;
+    has_new_sampler_params_ = true;
   }
 
   virtual void setLogger(const mppi::util::MPPILoggerPtr& logger)
@@ -422,6 +442,14 @@ public:
       changed = true;
       CONTROLLER_PARAMS_T controller_params = getNewControllerParams();
       controller_->setParams(controller_params);
+    }
+    // Update sampler params
+    if (hasNewSamplerParams())
+    {
+      std::lock_guard<std::mutex> guard(sampler_params_guard_);
+      changed = true;
+      SAMPLER_PARAMS_T sampler_params = getNewSamplerParams();
+      controller_->setSamplingParams(sampler_params);
     }
     return changed;
   }
