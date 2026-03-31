@@ -835,6 +835,7 @@ public:
   {
     bool change_seed = p.seed_ != params_.seed_;
     bool change_num_timesteps = p.num_timesteps_ != params_.num_timesteps_;
+    bool change_dt = p.dt_ != params_.dt_;
     // bool change_std_dev = p.control_std_dev_ != params_.control_std_dev_;
     params_ = p;
     if (change_num_timesteps)
@@ -844,6 +845,10 @@ public:
     if (change_seed)
     {
       setSeedCUDARandomNumberGen(params_.seed_);
+    }
+    if (change_dt)
+    {
+      fb_controller_->setDt(p.dt_);
     }
   }
 
