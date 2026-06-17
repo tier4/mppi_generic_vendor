@@ -295,7 +295,7 @@ typename CONTROLLER::SampledVisDeviceView CONTROLLER::sampledVisDeviceView() con
     view.num_rollouts = getTotalSampledTrajectories();
     view.num_timesteps = getNumTimesteps();
     view.output_dim = DYN_T::OUTPUT_DIM;
-    view.stream = vis_stream_;
+    view.stream = stream_;
   }
   return view;
 }

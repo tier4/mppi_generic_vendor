@@ -277,6 +277,7 @@ void VanillaMPPI::launchSampledVisTrajectories()
         this->getLambda(), this->getAlpha(), this->vis_initial_state_d_, this->sampled_outputs_d_,
         this->sampled_costs_d_, this->sampled_crash_status_d_, this->params_.visualize_dim_, this->stream_, false);
   }
+  HANDLE_ERROR(cudaStreamSynchronize(this->stream_));
 }
 
 VANILLA_MPPI_TEMPLATE
