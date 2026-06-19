@@ -272,3 +272,11 @@ if(NOT TARGET uninstall)
   add_custom_target(uninstall
     COMMAND ${CMAKE_COMMAND} -P ${CMAKE_CURRENT_BINARY_DIR}/cmake_uninstall.cmake)
 endif()
+
+# --- Autoware / colcon vendor package (same pattern as universe/external/glog) ---
+find_package(ament_cmake_auto QUIET)
+if (ament_cmake_auto_FOUND AND CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+  ament_export_include_directories(include)
+  ament_export_dependencies(Eigen3)
+  ament_auto_package()
+endif()
