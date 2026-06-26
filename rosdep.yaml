@@ -1,0 +1,22 @@
+# Rosdep rules for MPPI-Generic (mppi_generic_vendor).
+#
+# Register once (adjust path), then `rosdep update`:
+#   echo "yaml file://$(realpath rosdep.yaml)" | sudo tee /etc/ros/rosdep/sources.list.d/99-mppi-generic-vendor.list
+#
+# CUDA packages match pilot-auto amd64.env (cuda_version=12.8) / autoware.dev_env cuda role.
+# When autoware_cuda_dependency_meta is already in the workspace, `rosdep install -i`
+# skips it; install CUDA via setup-dev-env / ansible instead.
+
+autoware_cuda_dependency_meta:
+  ubuntu:
+    jammy:
+      apt:
+        packages:
+          - cuda-command-line-tools-12-8
+          - cuda-minimal-build-12-8
+          - cuda-nvcc-12-8
+          - libcublas-dev-12-8
+          - libcusparse-dev-12-8
+          - libcurand-dev-12-8
+          - libnpp-dev-12-8
+          - libnvjpeg-dev-12-8
