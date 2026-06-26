@@ -14,6 +14,16 @@ file(READ "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" MPPI_VERSION_FROM_FILE)
 string(STRIP "${MPPI_VERSION_FROM_FILE}" MPPI_VERSION)
 project(MPPI-Generic VERSION ${MPPI_VERSION} LANGUAGES C CXX CUDA)
 
+if(NOT (CUDAToolkit_FOUND AND TENSORRT_FOUND))
+  message(WARNING "cuda, tensorrt libraries are not found")
+  return()
+endif()
+
+if(TENSORRT_VERSION VERSION_LESS 8.5)
+  message(WARNING "Unsupported version TensorRT ${TENSORRT_VERSION} detected. This package requires TensorRT 8.5 or later.")
+  return()
+endif()
+
 ####################################
 # Set up options for configuration #
 ####################################
