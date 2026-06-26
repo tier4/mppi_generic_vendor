@@ -14,14 +14,27 @@ file(READ "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" MPPI_VERSION_FROM_FILE)
 string(STRIP "${MPPI_VERSION_FROM_FILE}" MPPI_VERSION)
 project(MPPI-Generic VERSION ${MPPI_VERSION} LANGUAGES C CXX CUDA)
 
-if(NOT (CUDAToolkit_FOUND AND TENSORRT_FOUND))
-  message(WARNING "cuda, tensorrt libraries are not found")
-  return()
-endif()
-
-if(TENSORRT_VERSION VERSION_LESS 8.5)
-  message(WARNING "Unsupported version TensorRT ${TENSORRT_VERSION} detected. This package requires TensorRT 8.5 or later.")
-  return()
+# set flags for CUDA availability
+option(CUDA_AVAIL "CUDA available" OFF)
+find_package(CUDA)
+if(CUDA_FOUND)
+  find_library(CUBLAS_LIBRARIES cublas HINTS
+    ${CUDA_TOOLKIT_ROOT_DIR}/lib64
+    ${CUDA_TOOLKIT_ROOT_DIR}/lib
+  )
+  if(CUDA_VERBOSE)
+    message("CUDA is available!")
+    message("CUDA Libs: ${CUDA_LIBRARIES}")
+    message("CUDA Headers: ${CUDA_INCLUDE_DIRS}")
+  endif()
+  # Note: cublas_device was depreciated in CUDA version 9.2
+  #       https://forums.developer.nvidia.com/t/where-can-i-find-libcublas-device-so-or-libcublas-device-a/67251/4
+  #       In LibTorch, CUDA_cublas_device_LIBRARY is used.
+  unset(CUDA_cublas_device_LIBRARY CACHE)
+  set(CUDA_AVAIL ON)
+else()
+  message("CUDA NOT FOUND")
+  set(CUDA_AVAIL OFF)
 endif()
 
 ####################################
