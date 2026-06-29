@@ -1,8 +1,4 @@
-if (CMAKE_VERSION VERSION_LESS 3.12)
-  cmake_minimum_required(VERSION 3.8)
-else()
-  cmake_minimum_required(VERSION 3.8...3.24)
-endif()
+cmake_minimum_required(VERSION 3.17)
 
 # https://cmake.org/cmake/help/latest/policy/CMP0104.html
 if (CMAKE_VERSION VERSION_LESS 3.24 AND POLICY CMP0104)
@@ -12,7 +8,7 @@ endif()
 file(READ "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" MPPI_VERSION_FROM_FILE)
 # Clean up trailng whitespace and newlines
 string(STRIP "${MPPI_VERSION_FROM_FILE}" MPPI_VERSION)
-project(MPPI-Generic VERSION ${MPPI_VERSION} LANGUAGES C CXX CUDA)
+project(MPPI-Generic VERSION ${MPPI_VERSION})
 
 # set flags for CUDA availability
 option(CUDA_AVAIL "CUDA available" OFF)
