@@ -239,6 +239,11 @@ void launchWeightedReductionKernel(const float* __restrict__ exp_costs_d, const 
 void launchNormExpKernel(int num_rollouts, int blocksize_x, float* trajectory_costs_d, float lambda_inv, float baseline,
                          cudaStream_t stream, bool synchronize = true);
 
+template <int NUM_ROLLOUTS>
+void launchWeightTransformKernel(float* __restrict__ costs_d, float2* __restrict__ baseline_and_norm_d,
+                                 const float lambda_inv, const int num_systems, cudaStream_t stream,
+                                 bool synchronize = true);
+
 void launchTsallisKernel(int num_rollouts, int blocksize_x, float* trajectory_costs_d, float gamma, float r,
                          float baseline, cudaStream_t stream, bool synchronize = true);
 
