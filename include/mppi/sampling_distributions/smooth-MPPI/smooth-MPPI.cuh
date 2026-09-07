@@ -65,7 +65,8 @@ public:
   //                                             bool synchronize = true);
 
   __host__ void updateDistributionParamsFromDevice(const float* trajectory_weights_d, float normalizer,
-                                                   const int& distribution_i, bool synchronize = false) override;
+                                                   const int& distribution_i, bool synchronize = false,
+                                                   const float2* baseline_and_norm_d = nullptr) override;
 
 protected:
   float* deriv_action_mean_d_ = nullptr;

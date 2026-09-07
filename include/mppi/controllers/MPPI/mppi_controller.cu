@@ -188,9 +188,14 @@ void VanillaMPPI::computeControl(const Eigen::Ref<const state_array>& state, int
         this->trajectory_costs_d_, this->cost_baseline_and_norm_d_, 1.0F / this->getLambda(), 1, this->stream_,
         false);
 
-    // Normalizer scalar needed on host for weighted reduction launch.
+    this->sampler_->updateDistributionParamsFromDevice(this->trajectory_costs_d_, 0.0F, 0, false,
+                                                       this->cost_baseline_and_norm_d_);
+
+    // Host copies for diagnostics only (baseline/normalizer stats and free energy).
     HANDLE_ERROR(cudaMemcpyAsync(this->cost_baseline_and_norm_.data(), this->cost_baseline_and_norm_d_, sizeof(float2),
                                  cudaMemcpyDeviceToHost, this->stream_));
+    HANDLE_ERROR(cudaMemcpyAsync(this->trajectory_costs_.data(), this->trajectory_costs_d_,
+                                 NUM_ROLLOUTS * sizeof(float), cudaMemcpyDeviceToHost, this->stream_));
     HANDLE_ERROR(cudaStreamSynchronize(this->stream_));
 
     if (this->getBaselineCost() > baseline_prev + 1)
@@ -199,13 +204,6 @@ void VanillaMPPI::computeControl(const Eigen::Ref<const state_array>& state, int
     }
 
     baseline_prev = this->getBaselineCost();
-
-    this->sampler_->updateDistributionParamsFromDevice(this->trajectory_costs_d_, this->getNormalizerCost(), 0, false);
-
-    // Copy weights for host-side free-energy diagnostics (not used by Autoware).
-    HANDLE_ERROR(cudaMemcpyAsync(this->trajectory_costs_.data(), this->trajectory_costs_d_,
-                                 NUM_ROLLOUTS * sizeof(float), cudaMemcpyDeviceToHost, this->stream_));
-    HANDLE_ERROR(cudaStreamSynchronize(this->stream_));
 
     mppi::kernels::computeFreeEnergy(this->free_energy_statistics_.real_sys.freeEnergyMean,
                                      this->free_energy_statistics_.real_sys.freeEnergyVariance,
