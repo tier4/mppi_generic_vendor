@@ -202,7 +202,8 @@ __host__ void SMOOTH_MPPI_NOISE::generateSamples(const int& optimization_stride,
 
 SMOOTH_MPPI_TEMPLATE
 __host__ void SMOOTH_MPPI_NOISE::updateDistributionParamsFromDevice(const float* trajectory_weights_d, float normalizer,
-                                                                    const int& distribution_i, bool synchronize)
+                                                                    const int& distribution_i, bool synchronize,
+                                                                    const float2* baseline_and_norm_d)
 {
   if (distribution_i >= this->getNumDistributions())
   {
@@ -214,9 +215,18 @@ __host__ void SMOOTH_MPPI_NOISE::updateDistributionParamsFromDevice(const float*
   int sample_index = distribution_i * this->getNumRollouts() * this->getNumTimesteps() * this->CONTROL_DIM;
   float* deriv_action_noise_i_d = &(this->deriv_action_noise_d_[sample_index]);
   float* deriv_action_mean_i_d = &(this->deriv_action_mean_d_[mean_index]);
-  mppi::kernels::launchWeightedReductionKernel<CONTROL_DIM>(
-      trajectory_weights_d, deriv_action_noise_i_d, deriv_action_mean_i_d, normalizer, this->getNumTimesteps(),
-      this->getNumRollouts(), this->params_.sum_strides, this->stream_, synchronize);
+  if (baseline_and_norm_d != nullptr)
+  {
+    mppi::kernels::launchWeightedReductionKernel<CONTROL_DIM>(
+        trajectory_weights_d, deriv_action_noise_i_d, deriv_action_mean_i_d, baseline_and_norm_d, distribution_i,
+        this->getNumTimesteps(), this->getNumRollouts(), this->params_.sum_strides, this->stream_, synchronize);
+  }
+  else
+  {
+    mppi::kernels::launchWeightedReductionKernel<CONTROL_DIM>(
+        trajectory_weights_d, deriv_action_noise_i_d, deriv_action_mean_i_d, normalizer, this->getNumTimesteps(),
+        this->getNumRollouts(), this->params_.sum_strides, this->stream_, synchronize);
+  }
   dim3 grid(1, 1, 1);
   dim3 block(1, this->CONTROL_DIM, 1);
   // std::cout << "Integrating optimal sequence" << std::endl;

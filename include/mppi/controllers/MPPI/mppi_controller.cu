@@ -183,12 +183,20 @@ void VanillaMPPI::computeControl(const Eigen::Ref<const state_array>& state, int
           this->params_.dynamics_rollout_dim_, this->stream_, false);
     }
 
-    // Copy the costs back to the host
+    // Baseline, norm-exp transform, and normalizer on device.
+    mppi::kernels::launchWeightTransformKernel<NUM_ROLLOUTS>(
+        this->trajectory_costs_d_, this->cost_baseline_and_norm_d_, 1.0F / this->getLambda(), 1, this->stream_,
+        false);
+
+    this->sampler_->updateDistributionParamsFromDevice(this->trajectory_costs_d_, 0.0F, 0, false,
+                                                       this->cost_baseline_and_norm_d_);
+
+    // Host copies for diagnostics only (baseline/normalizer stats and free energy).
+    HANDLE_ERROR(cudaMemcpyAsync(this->cost_baseline_and_norm_.data(), this->cost_baseline_and_norm_d_, sizeof(float2),
+                                 cudaMemcpyDeviceToHost, this->stream_));
     HANDLE_ERROR(cudaMemcpyAsync(this->trajectory_costs_.data(), this->trajectory_costs_d_,
                                  NUM_ROLLOUTS * sizeof(float), cudaMemcpyDeviceToHost, this->stream_));
     HANDLE_ERROR(cudaStreamSynchronize(this->stream_));
-
-    this->setBaseline(mppi::kernels::computeBaselineCost(this->trajectory_costs_.data(), NUM_ROLLOUTS));
 
     if (this->getBaselineCost() > baseline_prev + 1)
     {
@@ -197,23 +205,11 @@ void VanillaMPPI::computeControl(const Eigen::Ref<const state_array>& state, int
 
     baseline_prev = this->getBaselineCost();
 
-    // Launch the norm exponential kernel
-    mppi::kernels::launchNormExpKernel(NUM_ROLLOUTS, this->getNormExpThreads(), this->trajectory_costs_d_,
-                                       1.0 / this->getLambda(), this->getBaselineCost(), this->stream_, false);
-    HANDLE_ERROR(cudaMemcpyAsync(this->trajectory_costs_.data(), this->trajectory_costs_d_,
-                                 NUM_ROLLOUTS * sizeof(float), cudaMemcpyDeviceToHost, this->stream_));
-    HANDLE_ERROR(cudaStreamSynchronize(this->stream_));
-
-    // Compute the normalizer
-    this->setNormalizer(mppi::kernels::computeNormalizer(this->trajectory_costs_.data(), NUM_ROLLOUTS));
-
     mppi::kernels::computeFreeEnergy(this->free_energy_statistics_.real_sys.freeEnergyMean,
                                      this->free_energy_statistics_.real_sys.freeEnergyVariance,
                                      this->free_energy_statistics_.real_sys.freeEnergyModifiedVariance,
                                      this->trajectory_costs_.data(), NUM_ROLLOUTS, this->getBaselineCost(),
                                      this->getLambda());
-
-    this->sampler_->updateDistributionParamsFromDevice(this->trajectory_costs_d_, this->getNormalizerCost(), 0, false);
 
     // Transfer the new control to the host
     this->sampler_->setHostOptimalControlSequence(this->control_.data(), 0, true);
