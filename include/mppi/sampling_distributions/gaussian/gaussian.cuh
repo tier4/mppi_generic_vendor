@@ -26,6 +26,9 @@ struct GaussianParamsImpl : public SamplingParams<C_DIM>
   float control_cost_coeff[C_DIM] MPPI_ALIGN(sizeof(float4)) = { 0.0f };
   float pure_noise_trajectories_percentage = 0.01f;
   float std_dev_decay = 1.0f;
+  // VI-MPC (arxiv:1907.04202): also moment-match diagonal Σ from importance weights.
+  bool update_variance_from_weights = false;
+  float variance_update_min_std_dev[C_DIM * MAX_DISTRIBUTIONS] MPPI_ALIGN(sizeof(float4)) = { 0.0f };
   // Kernel launching params
   dim3 rewrite_controls_block_dim = dim3(32, 16, 1);
   int sum_strides = 32;
@@ -38,6 +41,7 @@ struct GaussianParamsImpl : public SamplingParams<C_DIM>
     for (int i = 0; i < this->CONTROL_DIM * MAX_DISTRIBUTIONS; i++)
     {
       std_dev[i] = 1.0f;
+      variance_update_min_std_dev[i] = 0.0f;
     }
   }
 
@@ -164,10 +168,46 @@ public:
                                                    const int& distribution_i, bool synchronize = false,
                                                    const float2* baseline_and_norm_d = nullptr) override;
 
+  /**
+   * @brief Copy device-side std_dev for a distribution into host params_.std_dev.
+   */
+  __host__ void syncHostStdDevFromDevice(const int& distribution_idx = 0, bool synchronize = true);
+
+  /**
+   * @brief Prepare a device buffer for per-iteration std_dev snapshots (VI-MPC).
+   * Layout per sample: CONTROL_DIM floats for distribution 0 (non-time-specific).
+   */
+  __host__ void beginStdDevHistory(int max_samples);
+
+  /** Append current device std_dev to the history buffer (async D2D on this->stream_). */
+  __host__ void recordStdDevHistorySample(const int& distribution_idx = 0);
+
+  /**
+   * @brief D2H current std_dev into params_ and the full std_dev history vector.
+   * Intended to ride the same stream sync as setHostOptimalControlSequence.
+   */
+  __host__ void syncHostStdDevAndHistoryFromDevice(const int& distribution_idx = 0, bool synchronize = true);
+
+  __host__ const std::vector<float>& getStdDevHistoryHost() const
+  {
+    return std_dev_history_host_;
+  }
+
+  __host__ int getStdDevHistorySampleCount() const
+  {
+    return std_dev_history_count_;
+  }
+
 protected:
   float* std_dev_d_ = nullptr;
   float* control_means_d_ = nullptr;
+  float* control_timestep_variances_d_ = nullptr;
+  float* variance_update_min_std_dev_d_ = nullptr;
+  float* std_dev_history_d_ = nullptr;
+  int std_dev_history_capacity_ = 0;
+  int std_dev_history_count_ = 0;
   std::vector<float> means_;
+  std::vector<float> std_dev_history_host_;
 };
 
 template <class DYN_PARAMS_T>

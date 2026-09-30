@@ -276,6 +276,204 @@ __global__ void setGaussianControls(const float* __restrict__ mean_d, const floa
   }
 }
 
+namespace
+{
+template <int CONTROL_DIM>
+__global__ void weightedVarianceReductionKernel(const float* __restrict__ exp_costs_d, const float* __restrict__ du_d,
+                                                const float* __restrict__ mean_d, float* __restrict__ variance_d,
+                                                const float normalizer, const int num_timesteps, const int num_rollouts,
+                                                const int sum_stride)
+{
+  const int thread_idx = threadIdx.x;
+  const int block_idx = blockIdx.x;
+  extern __shared__ float var_intermediate[];
+
+  float local[CONTROL_DIM];
+  for (int j = 0; j < CONTROL_DIM; ++j)
+  {
+    local[j] = 0.0f;
+    var_intermediate[thread_idx * CONTROL_DIM + j] = 0.0f;
+  }
+  __syncthreads();
+
+  const float inv_normalizer = (normalizer > 0.0f) ? (1.0f / normalizer) : 0.0f;
+  for (int i = 0; i < sum_stride; ++i)
+  {
+    const int rollout = thread_idx * sum_stride + i;
+    if (rollout < num_rollouts)
+    {
+      const float weight = exp_costs_d[rollout] * inv_normalizer;
+      for (int j = 0; j < CONTROL_DIM; ++j)
+      {
+        const float u = du_d[rollout * (num_timesteps * CONTROL_DIM) + block_idx * CONTROL_DIM + j];
+        const float mean = mean_d[block_idx * CONTROL_DIM + j];
+        const float diff = u - mean;
+        local[j] += weight * diff * diff;
+      }
+    }
+  }
+  for (int j = 0; j < CONTROL_DIM; ++j)
+  {
+    var_intermediate[thread_idx * CONTROL_DIM + j] = local[j];
+  }
+  __syncthreads();
+
+  if (thread_idx == 0 && block_idx < num_timesteps)
+  {
+    for (int j = 0; j < CONTROL_DIM; ++j)
+    {
+      local[j] = 0.0f;
+    }
+    const int num_partials = (num_rollouts - 1) / sum_stride + 1;
+    for (int i = 0; i < num_partials; ++i)
+    {
+      for (int j = 0; j < CONTROL_DIM; ++j)
+      {
+        local[j] += var_intermediate[i * CONTROL_DIM + j];
+      }
+    }
+    for (int j = 0; j < CONTROL_DIM; ++j)
+    {
+      variance_d[block_idx * CONTROL_DIM + j] = local[j];
+    }
+  }
+}
+
+template <int CONTROL_DIM>
+__global__ void weightedVarianceReductionKernelDeviceNorm(const float* __restrict__ exp_costs_d,
+                                                          const float* __restrict__ du_d,
+                                                          const float* __restrict__ mean_d,
+                                                          float* __restrict__ variance_d,
+                                                          const float2* __restrict__ baseline_and_norm_d,
+                                                          const int baseline_norm_index, const int num_timesteps,
+                                                          const int num_rollouts, const int sum_stride)
+{
+  const float normalizer = baseline_and_norm_d[baseline_norm_index].y;
+  const int thread_idx = threadIdx.x;
+  const int block_idx = blockIdx.x;
+  extern __shared__ float var_intermediate[];
+
+  float local[CONTROL_DIM];
+  for (int j = 0; j < CONTROL_DIM; ++j)
+  {
+    local[j] = 0.0f;
+    var_intermediate[thread_idx * CONTROL_DIM + j] = 0.0f;
+  }
+  __syncthreads();
+
+  const float inv_normalizer = (normalizer > 0.0f) ? (1.0f / normalizer) : 0.0f;
+  for (int i = 0; i < sum_stride; ++i)
+  {
+    const int rollout = thread_idx * sum_stride + i;
+    if (rollout < num_rollouts)
+    {
+      const float weight = exp_costs_d[rollout] * inv_normalizer;
+      for (int j = 0; j < CONTROL_DIM; ++j)
+      {
+        const float u = du_d[rollout * (num_timesteps * CONTROL_DIM) + block_idx * CONTROL_DIM + j];
+        const float mean = mean_d[block_idx * CONTROL_DIM + j];
+        const float diff = u - mean;
+        local[j] += weight * diff * diff;
+      }
+    }
+  }
+  for (int j = 0; j < CONTROL_DIM; ++j)
+  {
+    var_intermediate[thread_idx * CONTROL_DIM + j] = local[j];
+  }
+  __syncthreads();
+
+  if (thread_idx == 0 && block_idx < num_timesteps)
+  {
+    for (int j = 0; j < CONTROL_DIM; ++j)
+    {
+      local[j] = 0.0f;
+    }
+    const int num_partials = (num_rollouts - 1) / sum_stride + 1;
+    for (int i = 0; i < num_partials; ++i)
+    {
+      for (int j = 0; j < CONTROL_DIM; ++j)
+      {
+        local[j] += var_intermediate[i * CONTROL_DIM + j];
+      }
+    }
+    for (int j = 0; j < CONTROL_DIM; ++j)
+    {
+      variance_d[block_idx * CONTROL_DIM + j] = local[j];
+    }
+  }
+}
+
+template <int CONTROL_DIM>
+void launchWeightedVarianceReductionKernel(const float* exp_costs_d, const float* du_d, const float* mean_d,
+                                           float* variance_d, const float normalizer, const int num_timesteps,
+                                           const int num_rollouts, const int sum_stride, cudaStream_t stream,
+                                           bool synchronize)
+{
+  dim3 dimBlock(mppi::math::int_ceil(num_rollouts, sum_stride), 1, 1);
+  dim3 dimGrid(num_timesteps, 1, 1);
+  const unsigned shared_mem_size = mppi::math::nearest_multiple_4(CONTROL_DIM * dimBlock.x) * sizeof(float);
+  weightedVarianceReductionKernel<CONTROL_DIM><<<dimGrid, dimBlock, shared_mem_size, stream>>>(
+      exp_costs_d, du_d, mean_d, variance_d, normalizer, num_timesteps, num_rollouts, sum_stride);
+  HANDLE_ERROR(cudaGetLastError());
+  if (synchronize)
+  {
+    HANDLE_ERROR(cudaStreamSynchronize(stream));
+  }
+}
+
+template <int CONTROL_DIM>
+void launchWeightedVarianceReductionKernel(const float* exp_costs_d, const float* du_d, const float* mean_d,
+                                           float* variance_d, const float2* baseline_and_norm_d,
+                                           const int baseline_norm_index, const int num_timesteps,
+                                           const int num_rollouts, const int sum_stride, cudaStream_t stream,
+                                           bool synchronize)
+{
+  dim3 dimBlock(mppi::math::int_ceil(num_rollouts, sum_stride), 1, 1);
+  dim3 dimGrid(num_timesteps, 1, 1);
+  const unsigned shared_mem_size = mppi::math::nearest_multiple_4(CONTROL_DIM * dimBlock.x) * sizeof(float);
+  weightedVarianceReductionKernelDeviceNorm<CONTROL_DIM><<<dimGrid, dimBlock, shared_mem_size, stream>>>(
+      exp_costs_d, du_d, mean_d, variance_d, baseline_and_norm_d, baseline_norm_index, num_timesteps, num_rollouts,
+      sum_stride);
+  HANDLE_ERROR(cudaGetLastError());
+  if (synchronize)
+  {
+    HANDLE_ERROR(cudaStreamSynchronize(stream));
+  }
+}
+
+__global__ void finalizeStdDevFromTimestepVariances(const float* __restrict__ variance_per_timestep_d,
+                                                    float* __restrict__ std_dev_d,
+                                                    const float* __restrict__ min_std_dev_d, const int num_timesteps,
+                                                    const int control_dim, const bool time_specific_std_dev)
+{
+  const int c = static_cast<int>(threadIdx.x);
+  if (c >= control_dim)
+  {
+    return;
+  }
+  const float min_std = min_std_dev_d[c];
+  if (time_specific_std_dev)
+  {
+    for (int t = 0; t < num_timesteps; ++t)
+    {
+      const float variance = fmaxf(variance_per_timestep_d[t * control_dim + c], 0.0f);
+      std_dev_d[t * control_dim + c] = fmaxf(sqrtf(variance), min_std);
+    }
+  }
+  else
+  {
+    float variance_sum = 0.0f;
+    for (int t = 0; t < num_timesteps; ++t)
+    {
+      variance_sum += fmaxf(variance_per_timestep_d[t * control_dim + c], 0.0f);
+    }
+    const float mean_variance = (num_timesteps > 0) ? (variance_sum / static_cast<float>(num_timesteps)) : 0.0f;
+    std_dev_d[c] = fmaxf(sqrtf(mean_variance), min_std);
+  }
+}
+}  // namespace
+
 GAUSSIAN_TEMPLATE
 GAUSSIAN_CLASS::GaussianDistributionImpl(cudaStream_t stream) : PARENT_CLASS::SamplingDistribution(stream)
 {
@@ -308,21 +506,46 @@ __host__ void GAUSSIAN_CLASS::allocateCUDAMemoryHelper()
       HANDLE_ERROR(cudaFree(control_means_d_));
 #endif
     }
+    if (control_timestep_variances_d_)
+    {
+#if defined(CUDART_VERSION) && CUDART_VERSION > 11200
+      HANDLE_ERROR(cudaFreeAsync(control_timestep_variances_d_, this->stream_));
+#else
+      HANDLE_ERROR(cudaFree(control_timestep_variances_d_));
+#endif
+      control_timestep_variances_d_ = nullptr;
+    }
+    if (variance_update_min_std_dev_d_)
+    {
+#if defined(CUDART_VERSION) && CUDART_VERSION > 11200
+      HANDLE_ERROR(cudaFreeAsync(variance_update_min_std_dev_d_, this->stream_));
+#else
+      HANDLE_ERROR(cudaFree(variance_update_min_std_dev_d_));
+#endif
+      variance_update_min_std_dev_d_ = nullptr;
+    }
 
     int std_dev_size = CONTROL_DIM * this->getNumDistributions();
     if (this->params_.time_specific_std_dev)
     {
       std_dev_size *= this->getNumTimesteps();
     }
+    const int variance_size = this->getNumDistributions() * this->getNumTimesteps() * CONTROL_DIM;
+    const int min_std_size = CONTROL_DIM * this->getNumDistributions();
 #if defined(CUDART_VERSION) && CUDART_VERSION > 11200
     HANDLE_ERROR(cudaMallocAsync((void**)&std_dev_d_, sizeof(float) * std_dev_size, this->stream_));
     HANDLE_ERROR(cudaMallocAsync((void**)&control_means_d_,
                                  sizeof(float) * this->getNumDistributions() * this->getNumTimesteps() * CONTROL_DIM,
                                  this->stream_));
+    HANDLE_ERROR(cudaMallocAsync((void**)&control_timestep_variances_d_, sizeof(float) * variance_size, this->stream_));
+    HANDLE_ERROR(
+        cudaMallocAsync((void**)&variance_update_min_std_dev_d_, sizeof(float) * min_std_size, this->stream_));
 #else
     HANDLE_ERROR(cudaMalloc((void**)&std_dev_d_, sizeof(float) * std_dev_size));
     HANDLE_ERROR(cudaMalloc((void**)&control_means_d_,
                             sizeof(float) * this->getNumDistributions() * this->getNumTimesteps() * CONTROL_DIM));
+    HANDLE_ERROR(cudaMalloc((void**)&control_timestep_variances_d_, sizeof(float) * variance_size));
+    HANDLE_ERROR(cudaMalloc((void**)&variance_update_min_std_dev_d_, sizeof(float) * min_std_size));
 #endif
     means_.resize(this->getNumDistributions() * this->getNumTimesteps() * CONTROL_DIM);
     // Ensure that the device side point knows where the the standard deviation memory is located
@@ -340,8 +563,26 @@ __host__ void GAUSSIAN_CLASS::freeCudaMem()
   {
     HANDLE_ERROR(cudaFree(control_means_d_));
     HANDLE_ERROR(cudaFree(std_dev_d_));
+    if (control_timestep_variances_d_)
+    {
+      HANDLE_ERROR(cudaFree(control_timestep_variances_d_));
+    }
+    if (variance_update_min_std_dev_d_)
+    {
+      HANDLE_ERROR(cudaFree(variance_update_min_std_dev_d_));
+    }
+    if (std_dev_history_d_)
+    {
+      HANDLE_ERROR(cudaFree(std_dev_history_d_));
+    }
     control_means_d_ = nullptr;
     std_dev_d_ = nullptr;
+    control_timestep_variances_d_ = nullptr;
+    variance_update_min_std_dev_d_ = nullptr;
+    std_dev_history_d_ = nullptr;
+    std_dev_history_capacity_ = 0;
+    std_dev_history_count_ = 0;
+    std_dev_history_host_.clear();
   }
   PARENT_CLASS::freeCudaMem();
 }
@@ -361,6 +602,12 @@ void GAUSSIAN_CLASS::paramsToDevice(bool synchronize)
     else
     {
       HANDLE_ERROR(cudaMemcpyAsync(this->std_dev_d_, this->params_.std_dev,
+                                   sizeof(float) * CONTROL_DIM * this->getNumDistributions(), cudaMemcpyHostToDevice,
+                                   this->stream_));
+    }
+    if (variance_update_min_std_dev_d_ != nullptr)
+    {
+      HANDLE_ERROR(cudaMemcpyAsync(variance_update_min_std_dev_d_, this->params_.variance_update_min_std_dev,
                                    sizeof(float) * CONTROL_DIM * this->getNumDistributions(), cudaMemcpyHostToDevice,
                                    this->stream_));
     }
@@ -445,21 +692,137 @@ __host__ void GAUSSIAN_CLASS::updateDistributionParamsFromDevice(const float* tr
   float* control_samples_i_d =
       &(this->control_samples_d_[distribution_i * this->getNumRollouts() * this->getNumTimesteps() * CONTROL_DIM]);
   float* control_mean_i_d = &(this->control_means_d_[distribution_i * this->getNumTimesteps() * CONTROL_DIM]);
+  // Mean and variance kernels share this->stream_; device ordering is enough (no host sync between them).
   if (baseline_and_norm_d != nullptr)
   {
     mppi::kernels::launchWeightedReductionKernel<CONTROL_DIM>(
         trajectory_weights_d, control_samples_i_d, control_mean_i_d, baseline_and_norm_d, distribution_i,
-        this->getNumTimesteps(), this->getNumRollouts(), this->params_.sum_strides, this->stream_, synchronize);
+        this->getNumTimesteps(), this->getNumRollouts(), this->params_.sum_strides, this->stream_, false);
   }
   else
   {
-    mppi::kernels::launchWeightedReductionKernel<CONTROL_DIM>(trajectory_weights_d, control_samples_i_d, control_mean_i_d,
-                                                              normalizer, this->getNumTimesteps(), this->getNumRollouts(),
-                                                              this->params_.sum_strides, this->stream_, synchronize);
+    mppi::kernels::launchWeightedReductionKernel<CONTROL_DIM>(
+        trajectory_weights_d, control_samples_i_d, control_mean_i_d, normalizer, this->getNumTimesteps(),
+        this->getNumRollouts(), this->params_.sum_strides, this->stream_, false);
   }
-  HANDLE_ERROR(cudaMemcpyAsync(&means_[distribution_i * this->getNumTimesteps() * CONTROL_DIM], control_mean_i_d,
-                               sizeof(float) * this->getNumTimesteps() * CONTROL_DIM, cudaMemcpyDeviceToHost,
-                               this->stream_));
+  // Defer host means_ refresh to synchronize==true (or setHostOptimalControlSequence). Keeps the
+  // VI-MPC inner loop on-device without a per-iter full-horizon D2H.
+  if (synchronize)
+  {
+    HANDLE_ERROR(cudaMemcpyAsync(&means_[distribution_i * this->getNumTimesteps() * CONTROL_DIM], control_mean_i_d,
+                                 sizeof(float) * this->getNumTimesteps() * CONTROL_DIM, cudaMemcpyDeviceToHost,
+                                 this->stream_));
+  }
+
+  if (this->params_.update_variance_from_weights && control_timestep_variances_d_ != nullptr &&
+      variance_update_min_std_dev_d_ != nullptr)
+  {
+    float* variance_i_d =
+        &(control_timestep_variances_d_[distribution_i * this->getNumTimesteps() * CONTROL_DIM]);
+    if (baseline_and_norm_d != nullptr)
+    {
+      launchWeightedVarianceReductionKernel<CONTROL_DIM>(
+          trajectory_weights_d, control_samples_i_d, control_mean_i_d, variance_i_d, baseline_and_norm_d, distribution_i,
+          this->getNumTimesteps(), this->getNumRollouts(), this->params_.sum_strides, this->stream_, false);
+    }
+    else
+    {
+      launchWeightedVarianceReductionKernel<CONTROL_DIM>(
+          trajectory_weights_d, control_samples_i_d, control_mean_i_d, variance_i_d, normalizer, this->getNumTimesteps(),
+          this->getNumRollouts(), this->params_.sum_strides, this->stream_, false);
+    }
+
+    float* std_dev_i_d = this->params_.time_specific_std_dev
+                             ? &(std_dev_d_[distribution_i * this->getNumTimesteps() * CONTROL_DIM])
+                             : &(std_dev_d_[distribution_i * CONTROL_DIM]);
+    finalizeStdDevFromTimestepVariances<<<1, CONTROL_DIM, 0, this->stream_>>>(
+        variance_i_d, std_dev_i_d, &(variance_update_min_std_dev_d_[distribution_i * CONTROL_DIM]),
+        this->getNumTimesteps(), CONTROL_DIM, this->params_.time_specific_std_dev);
+    HANDLE_ERROR(cudaGetLastError());
+  }
+
+  if (synchronize)
+  {
+    HANDLE_ERROR(cudaStreamSynchronize(this->stream_));
+  }
+}
+
+GAUSSIAN_TEMPLATE
+__host__ void GAUSSIAN_CLASS::syncHostStdDevFromDevice(const int& distribution_idx, bool synchronize)
+{
+  if (distribution_idx >= this->getNumDistributions() || std_dev_d_ == nullptr)
+  {
+    return;
+  }
+  if (this->params_.time_specific_std_dev)
+  {
+    const int num_values = this->getNumTimesteps() * CONTROL_DIM;
+    HANDLE_ERROR(cudaMemcpyAsync(&(this->params_.std_dev[distribution_idx * num_values]),
+                                 &(std_dev_d_[distribution_idx * num_values]), sizeof(float) * num_values,
+                                 cudaMemcpyDeviceToHost, this->stream_));
+  }
+  else
+  {
+    HANDLE_ERROR(cudaMemcpyAsync(&(this->params_.std_dev[distribution_idx * CONTROL_DIM]),
+                                 &(std_dev_d_[distribution_idx * CONTROL_DIM]), sizeof(float) * CONTROL_DIM,
+                                 cudaMemcpyDeviceToHost, this->stream_));
+  }
+  if (synchronize)
+  {
+    HANDLE_ERROR(cudaStreamSynchronize(this->stream_));
+  }
+}
+
+GAUSSIAN_TEMPLATE
+__host__ void GAUSSIAN_CLASS::beginStdDevHistory(int max_samples)
+{
+  std_dev_history_count_ = 0;
+  std_dev_history_host_.clear();
+  if (max_samples <= 0)
+  {
+    return;
+  }
+  if (max_samples > std_dev_history_capacity_ || std_dev_history_d_ == nullptr)
+  {
+    if (std_dev_history_d_)
+    {
+      HANDLE_ERROR(cudaFree(std_dev_history_d_));
+      std_dev_history_d_ = nullptr;
+    }
+    HANDLE_ERROR(cudaMalloc((void**)&std_dev_history_d_, sizeof(float) * max_samples * CONTROL_DIM));
+    std_dev_history_capacity_ = max_samples;
+  }
+}
+
+GAUSSIAN_TEMPLATE
+__host__ void GAUSSIAN_CLASS::recordStdDevHistorySample(const int& distribution_idx)
+{
+  if (std_dev_history_d_ == nullptr || std_dev_d_ == nullptr || std_dev_history_count_ >= std_dev_history_capacity_ ||
+      distribution_idx >= this->getNumDistributions())
+  {
+    return;
+  }
+  // History stores the active (non-time-specific) std_dev vector used for sampling scale.
+  const float* src = this->params_.time_specific_std_dev
+                         ? &(std_dev_d_[distribution_idx * this->getNumTimesteps() * CONTROL_DIM])
+                         : &(std_dev_d_[distribution_idx * CONTROL_DIM]);
+  // For time-specific Σ, snapshot t=0 as a compact history sample.
+  HANDLE_ERROR(cudaMemcpyAsync(&(std_dev_history_d_[std_dev_history_count_ * CONTROL_DIM]), src,
+                               sizeof(float) * CONTROL_DIM, cudaMemcpyDeviceToDevice, this->stream_));
+  ++std_dev_history_count_;
+}
+
+GAUSSIAN_TEMPLATE
+__host__ void GAUSSIAN_CLASS::syncHostStdDevAndHistoryFromDevice(const int& distribution_idx, bool synchronize)
+{
+  syncHostStdDevFromDevice(distribution_idx, false);
+  std_dev_history_host_.assign(static_cast<size_t>(std_dev_history_count_ * CONTROL_DIM), 0.0f);
+  if (std_dev_history_d_ != nullptr && std_dev_history_count_ > 0)
+  {
+    HANDLE_ERROR(cudaMemcpyAsync(std_dev_history_host_.data(), std_dev_history_d_,
+                                 sizeof(float) * std_dev_history_count_ * CONTROL_DIM, cudaMemcpyDeviceToHost,
+                                 this->stream_));
+  }
   if (synchronize)
   {
     HANDLE_ERROR(cudaStreamSynchronize(this->stream_));

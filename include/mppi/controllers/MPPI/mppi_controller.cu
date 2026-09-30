@@ -157,7 +157,13 @@ void VanillaMPPI::computeControl(const Eigen::Ref<const state_array>& state, int
   HANDLE_ERROR(cudaMemcpyAsync(this->initial_state_d_, state.data(), DYN_T::STATE_DIM * sizeof(float),
                                cudaMemcpyHostToDevice, this->stream_));
 
-  float baseline_prev = 1e8;
+  const bool track_std_dev_history = this->sampler_->getParams().update_variance_from_weights;
+  if (track_std_dev_history)
+  {
+    // Sample 0 = Σ before inner iterations; samples 1..N = Σ after each moment-matching update.
+    this->sampler_->beginStdDevHistory(this->getNumIters() + 1);
+    this->sampler_->recordStdDevHistorySample(0);
+  }
 
   for (int opt_iter = 0; opt_iter < this->getNumIters(); opt_iter++)
   {
@@ -190,31 +196,34 @@ void VanillaMPPI::computeControl(const Eigen::Ref<const state_array>& state, int
 
     this->sampler_->updateDistributionParamsFromDevice(this->trajectory_costs_d_, 0.0F, 0, false,
                                                        this->cost_baseline_and_norm_d_);
-
-    // Host copies for diagnostics only (baseline/normalizer stats and free energy).
-    HANDLE_ERROR(cudaMemcpyAsync(this->cost_baseline_and_norm_.data(), this->cost_baseline_and_norm_d_, sizeof(float2),
-                                 cudaMemcpyDeviceToHost, this->stream_));
-    HANDLE_ERROR(cudaMemcpyAsync(this->trajectory_costs_.data(), this->trajectory_costs_d_,
-                                 NUM_ROLLOUTS * sizeof(float), cudaMemcpyDeviceToHost, this->stream_));
-    HANDLE_ERROR(cudaStreamSynchronize(this->stream_));
-
-    if (this->getBaselineCost() > baseline_prev + 1)
+    if (track_std_dev_history)
     {
-      this->logger_->debug("Previous Baseline: %f\n         Baseline: %f\n", baseline_prev, this->getBaselineCost());
+      this->sampler_->recordStdDevHistorySample(0);
     }
-
-    baseline_prev = this->getBaselineCost();
-
-    mppi::kernels::computeFreeEnergy(this->free_energy_statistics_.real_sys.freeEnergyMean,
-                                     this->free_energy_statistics_.real_sys.freeEnergyVariance,
-                                     this->free_energy_statistics_.real_sys.freeEnergyModifiedVariance,
-                                     this->trajectory_costs_.data(), NUM_ROLLOUTS, this->getBaselineCost(),
-                                     this->getLambda());
-
-    // Transfer the new control to the host
-    this->sampler_->setHostOptimalControlSequence(this->control_.data(), 0, true);
+    // Keep the optimization loop on-device. Host baseline/cost/control/std_dev copies happen once
+    // after the final iteration.
   }
 
+  // Final host copies for getControlSeq / getBaselineCost / getSampledCostSeq / VI-MPC Σ.
+  HANDLE_ERROR(cudaMemcpyAsync(this->cost_baseline_and_norm_.data(), this->cost_baseline_and_norm_d_, sizeof(float2),
+                               cudaMemcpyDeviceToHost, this->stream_));
+  HANDLE_ERROR(cudaMemcpyAsync(this->trajectory_costs_.data(), this->trajectory_costs_d_,
+                               NUM_ROLLOUTS * sizeof(float), cudaMemcpyDeviceToHost, this->stream_));
+  this->sampler_->setHostOptimalControlSequence(this->control_.data(), 0, false);
+  if (track_std_dev_history)
+  {
+    this->sampler_->syncHostStdDevAndHistoryFromDevice(0, true);
+  }
+  else
+  {
+    HANDLE_ERROR(cudaStreamSynchronize(this->stream_));
+  }
+
+  mppi::kernels::computeFreeEnergy(this->free_energy_statistics_.real_sys.freeEnergyMean,
+                                   this->free_energy_statistics_.real_sys.freeEnergyVariance,
+                                   this->free_energy_statistics_.real_sys.freeEnergyModifiedVariance,
+                                   this->trajectory_costs_.data(), NUM_ROLLOUTS, this->getBaselineCost(),
+                                   this->getLambda());
   this->free_energy_statistics_.real_sys.normalizerPercent = this->getNormalizerCost() / NUM_ROLLOUTS;
   this->free_energy_statistics_.real_sys.increase =
       this->getBaselineCost() - this->free_energy_statistics_.real_sys.previousBaseline;
@@ -226,7 +235,7 @@ void VanillaMPPI::computeControl(const Eigen::Ref<const state_array>& state, int
     this->model_->enforceConstraints(zero_state, this->control_.col(i));
   }
 
-  // Copy back sampled trajectories
+  // Copy back sampled trajectories (no-op when visualization sample percentage is zero).
   this->copySampledControlFromDevice(false);
   if (this->getKernelChoiceAsEnum() == kernelType::USE_SINGLE_KERNEL)
   {  // copy initial state to vis initial state for use with visualizeKernel
