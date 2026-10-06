@@ -1,4 +1,6 @@
 #include <gtest/gtest.h>
+#include <limits>
+#include <vector>
 #include <mppi/instantiations/cartpole_mppi/cartpole_mppi.cuh>
 #include <mppi/instantiations/quadrotor_mppi/quadrotor_mppi.cuh>
 
@@ -53,6 +55,97 @@ public:
     delete sampler;
   }
 };
+
+class ScriptedCostMPPI : public Cartpole_VanillaMPPI::CONTROLLER_T
+{
+public:
+  using Base = Cartpole_VanillaMPPI::CONTROLLER_T;
+  using Base::Base;
+  std::vector<float> costs;
+  std::vector<std::vector<float>> costs_by_iteration;
+  std::vector<float> iteration_lambdas;
+
+protected:
+  bool requiresRawRolloutCostsForIteration() const override
+  {
+    return true;
+  }
+  void optimizationIterationComplete(int iteration) override
+  {
+    iteration_lambdas.push_back(this->getLambda());
+    const auto& population = costs_by_iteration.empty() ? costs : costs_by_iteration.at(iteration);
+    HANDLE_ERROR(cudaMemcpyAsync(this->trajectory_costs_d_, population.data(), population.size() * sizeof(float),
+                                 cudaMemcpyHostToDevice, this->stream_));
+  }
+};
+
+TEST_F(Cartpole_VanillaMPPI, AdaptiveLambdaIsFixedWithinCycleAndRawTailIsRetained)
+{
+  delete controller;
+  controller = nullptr;
+  auto* scripted = new ScriptedCostMPPI(&model, &cost, fb_controller, sampler, dt, 2, 0.05F, alpha, NUM_TIMESTEPS,
+                                        init_control, stream);
+  controller = scripted;
+  scripted->configureEssLambdaAdaptation(0.1F, 0.3F, 0.005F, 2.0F);
+  scripted->costs.resize(NUM_ROLLOUTS);
+  for (int i = 0; i < NUM_ROLLOUTS; ++i)
+    scripted->costs[i] = static_cast<float>(i);
+  scripted->costs.back() = 1.0E12F;
+  scripted->computeControl(DYN_T::state_array::Zero(), 1);
+  ASSERT_EQ(scripted->iteration_lambdas.size(), 2U);
+  for (float value : scripted->iteration_lambdas)
+    EXPECT_FLOAT_EQ(value, 0.05F);
+  EXPECT_FLOAT_EQ(scripted->getLastWeightLambda(), 0.05F);
+  EXPECT_EQ(scripted->downloadRawRolloutCostsToHost(), scripted->costs);
+  EXPECT_LT(scripted->getLastNormalizationUpperCost(), scripted->costs.back());
+  const float next = scripted->getNextWeightLambda();
+  scripted->iteration_lambdas.clear();
+  scripted->computeControl(DYN_T::state_array::Zero(), 1);
+  for (float value : scripted->iteration_lambdas)
+    EXPECT_FLOAT_EQ(value, next);
+}
+
+TEST_F(Cartpole_VanillaMPPI, FailedWeightsPreserveNominalAndAdaptiveTemperature)
+{
+  delete controller;
+  controller = nullptr;
+  const control_trajectory seed = control_trajectory::Constant(0.2F);
+  auto* scripted =
+      new ScriptedCostMPPI(&model, &cost, fb_controller, sampler, dt, 2, 0.05F, alpha, NUM_TIMESTEPS, seed, stream);
+  controller = scripted;
+  scripted->configureEssLambdaAdaptation(0.1F, 0.3F, 0.005F, 2.0F);
+  scripted->costs.assign(NUM_ROLLOUTS, std::numeric_limits<float>::quiet_NaN());
+  EXPECT_THROW(scripted->computeControl(DYN_T::state_array::Zero(), 1), NoEligibleRollouts);
+  EXPECT_TRUE((scripted->getControlSeq().array() == seed.array()).all());
+  EXPECT_FLOAT_EQ(scripted->getNextWeightLambda(), 0.05F);
+}
+
+TEST_F(Cartpole_VanillaMPPI, EarlyFailureDiagnosticsSurviveLaterRecovery)
+{
+  delete controller;
+  controller = nullptr;
+  const control_trajectory seed = control_trajectory::Constant(0.2F);
+  auto* scripted =
+      new ScriptedCostMPPI(&model, &cost, fb_controller, sampler, dt, 2, 0.05F, alpha, NUM_TIMESTEPS, seed, stream);
+  controller = scripted;
+  scripted->costs_by_iteration = { std::vector<float>(NUM_ROLLOUTS, std::numeric_limits<float>::quiet_NaN()),
+                                   std::vector<float>(NUM_ROLLOUTS, 1.0F) };
+  EXPECT_THROW(scripted->computeControl(DYN_T::state_array::Zero(), 1), NoEligibleRollouts);
+  EXPECT_EQ(scripted->getFailedIteration(), 0);
+  EXPECT_EQ(scripted->getLastEligibleRolloutCount(), 0);
+  ASSERT_EQ(scripted->getIterationWeightStats().size(), 2U);
+  EXPECT_EQ(scripted->getIterationWeightStats()[0].finite_count, 0);
+  EXPECT_EQ(scripted->getIterationWeightStats()[1].eligible_count, NUM_ROLLOUTS);
+  ASSERT_EQ(scripted->getIterationEffectiveSampleSizes().size(), 2U);
+  EXPECT_FLOAT_EQ(scripted->getIterationEffectiveSampleSizes()[0], 0.0F);
+  EXPECT_TRUE((scripted->getControlSeq().array() == seed.array()).all());
+  EXPECT_TRUE(std::isnan(scripted->getBaselineCost()));
+
+  scripted->costs_by_iteration[0].assign(NUM_ROLLOUTS, 1.0F);
+  EXPECT_NO_THROW(scripted->computeControl(DYN_T::state_array::Zero(), 1));
+  EXPECT_EQ(scripted->getFailedIteration(), -1);
+  EXPECT_EQ(scripted->getLastEligibleRolloutCount(), NUM_ROLLOUTS);
+}
 
 TEST_F(Cartpole_VanillaMPPI, BindToStream)
 {

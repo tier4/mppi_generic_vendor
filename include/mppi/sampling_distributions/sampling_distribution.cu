@@ -9,9 +9,17 @@ void SamplingDistribution<CLASS_T, PARAMS_TEMPLATE, DYN_PARAMS_T>::GPUSetup()
   CLASS_T* derived = static_cast<CLASS_T*>(this);
   if (!GPUMemStatus_)
   {
-    sampling_d_ = Managed::GPUSetup<CLASS_T>(derived);
-    allocateCUDAMemory();
-    resizeVisualizationControlTrajectories(true);
+    try
+    {
+      sampling_d_ = Managed::GPUSetup<CLASS_T>(derived);
+      allocateCUDAMemory();
+      resizeVisualizationControlTrajectories(true);
+    }
+    catch (...)
+    {
+      cleanupNoThrow([&] { derived->freeCudaMem(); });
+      throw;
+    }
   }
   else
   {
@@ -25,14 +33,14 @@ __host__ void SamplingDistribution<CLASS_T, PARAMS_TEMPLATE, DYN_PARAMS_T>::free
 {
   if (GPUMemStatus_)
   {
-    HANDLE_ERROR(cudaFree(sampling_d_));
-    HANDLE_ERROR(cudaFree(control_samples_d_));
-    HANDLE_ERROR(cudaFree(vis_control_samples_d_));
-    GPUMemStatus_ = false;
-    sampling_d_ = nullptr;
-    control_samples_d_ = nullptr;
-    vis_control_samples_d_ = nullptr;
+    gpuAssert(cudaStreamSynchronize(stream_), __FILE__, __LINE__, false);
+    if (vis_stream_ != stream_)
+      gpuAssert(cudaStreamSynchronize(vis_stream_), __FILE__, __LINE__, false);
   }
+  cudaFreeNoThrow(sampling_d_);
+  cudaFreeNoThrow(control_samples_d_);
+  cudaFreeNoThrow(vis_control_samples_d_);
+  GPUMemStatus_ = false;
 }
 
 template <class CLASS_T, template <int> class PARAMS_TEMPLATE, class DYN_PARAMS_T>
@@ -40,13 +48,12 @@ __device__ void SamplingDistribution<CLASS_T, PARAMS_TEMPLATE, DYN_PARAMS_T>::in
     const float* __restrict__ output, const float t_0, const float dt, float* __restrict__ theta_d)
 {
   SAMPLING_PARAMS_T* shared = reinterpret_cast<SAMPLING_PARAMS_T*>(theta_d);
-  *shared = this->params_;
-  // #ifdef __CUDA_ARCH__
-  //   if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0 && blockIdx.y == 0)
-  //   {
-  //     printf("Num timesteps: %d %d\n", this->params_.num_timesteps, shared->num_timesteps);
-  //   }
-  // #endif
+  // One parameter structure is shared by the entire block, including all distributions.
+  // Callers synchronize the block after initialization and before reading theta_d.
+  if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0)
+  {
+    *shared = this->params_;
+  }
 }
 
 template <class CLASS_T, template <int> class PARAMS_TEMPLATE, class DYN_PARAMS_T>
@@ -99,8 +106,10 @@ __host__ void SamplingDistribution<CLASS_T, PARAMS_TEMPLATE, DYN_PARAMS_T>::allo
     {  // deallocate previous memory for control samples
 #if defined(CUDART_VERSION) && CUDART_VERSION > 11200
       HANDLE_ERROR(cudaFreeAsync(control_samples_d_, stream_));
+      control_samples_d_ = nullptr;
 #else
       HANDLE_ERROR(cudaFree(control_samples_d_));
+      control_samples_d_ = nullptr;
 #endif
       // control_samples_d_ = nullptr;
     }
@@ -135,8 +144,10 @@ SamplingDistribution<CLASS_T, PARAMS_TEMPLATE, DYN_PARAMS_T>::resizeVisualizatio
     {  // deallocate previous memory for control samples
 #if defined(CUDART_VERSION) && CUDART_VERSION > 11200
       HANDLE_ERROR(cudaFreeAsync(vis_control_samples_d_, vis_stream_));
+      vis_control_samples_d_ = nullptr;
 #else
       HANDLE_ERROR(cudaFree(vis_control_samples_d_));
+      vis_control_samples_d_ = nullptr;
 #endif
       // vis_control_samples_d_ = nullptr;
     }
@@ -280,6 +291,8 @@ __device__ void SamplingDistribution<CLASS_T, PARAMS_TEMPLATE, DYN_PARAMS_T>::wr
     const int& sample_index, const int& t, const int& distribution_index, const float* __restrict__ control,
     float* __restrict__ theta_d, const int& block_size, const int& thread_index, const float* __restrict__ output)
 {
+  // The loops below assign disjoint scalar/vector chunks using thread_index and block_size.
+  // All workers must participate; a Y==0 guard would omit chunks for larger control dimensions.
   SAMPLING_PARAMS_T* params_p = (SAMPLING_PARAMS_T*)theta_d;
   const int distribution_i = distribution_index >= params_p->num_distributions ? 0 : distribution_index;
   const int control_index =

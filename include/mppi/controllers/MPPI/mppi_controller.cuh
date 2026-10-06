@@ -11,6 +11,18 @@
 #include <mppi/controllers/controller.cuh>
 #include <mppi/sampling_distributions/gaussian/gaussian.cuh>
 
+#include <vector>
+#include <stdexcept>
+
+/** No candidate from this control step may be applied; callers must use their fallback policy. */
+class NoEligibleRollouts : public std::runtime_error
+{
+public:
+  NoEligibleRollouts() : std::runtime_error("MPPI optimization failed: no finite, collision-free rollout weights")
+  {
+  }
+};
+
 template <class DYN_T, class COST_T, class FB_T, int MAX_TIMESTEPS, int NUM_ROLLOUTS,
           class SAMPLING_T = ::mppi::sampling_distributions::GaussianDistribution<typename DYN_T::DYN_PARAMS_T>,
           class PARAMS_T = ControllerParams<DYN_T::STATE_DIM, DYN_T::CONTROL_DIM, MAX_TIMESTEPS>>
@@ -25,6 +37,7 @@ public:
   using control_trajectory = typename PARENT_CLASS::control_trajectory;
   using state_trajectory = typename PARENT_CLASS::state_trajectory;
   using state_array = typename PARENT_CLASS::state_array;
+  using output_array = typename PARENT_CLASS::output_array;
   using sampled_cost_traj = typename PARENT_CLASS::sampled_cost_traj;
   using FEEDBACK_GPU = typename PARENT_CLASS::TEMPLATED_FEEDBACK_GPU;
 
@@ -66,7 +79,104 @@ public:
 
   void chooseAppropriateKernel() override;
 
+  /** Configure robust weighting, the ESS target, and bounded temperature feedback. */
+  void configureEssLambdaAdaptation(float target_ess_ratio, float adaptation_gain,
+                                    float lambda_min, float lambda_max,
+                                    float unsafe_rollout_fraction_threshold = 0.95F,
+                                    float cost_normalization_percentile = 0.95F);
+
+  const std::vector<float>& getIterationEffectiveSampleSizes() const
+  {
+    return iteration_effective_sample_sizes_;
+  }
+
+  float getLastWeightLambda() const
+  {
+    return last_iteration_weight_lambda_;
+  }
+
+  float getNextWeightLambda() const
+  {
+    return last_weight_lambda_;
+  }
+
+  float getLastMinRolloutCost() const
+  {
+    return lastWeightStats().min_cost;
+  }
+
+  float getLastMaxRolloutCost() const
+  {
+    return lastWeightStats().max_cost;
+  }
+
+  float getLastNormalizationUpperCost() const
+  {
+    return lastWeightStats().normalization_upper_cost;
+  }
+
+  float getLastUnsafeRolloutFraction() const
+  {
+    return lastWeightStats().unsafe_rollout_fraction;
+  }
+
+  /** Zero-based failed iteration, or -1 after a successful control step. */
+  int getFailedIteration() const
+  {
+    return failed_iteration_;
+  }
+  const std::vector<mppi::kernels::CostWeightStats>& getIterationWeightStats() const
+  {
+    return iteration_weight_stats_;
+  }
+
+  int getLastEligibleRolloutCount() const
+  {
+    return lastWeightStats().eligible_count;
+  }
+  int getLastMinimumCostCount() const
+  {
+    return lastWeightStats().minimum_cost_count;
+  }
+  bool hasUnsafeRolloutPopulation() const
+  {
+    // Diagnostic only. Exploration/fallback decisions must not flatten safety weighting.
+    return getLastUnsafeRolloutFraction() >= unsafe_rollout_fraction_threshold_;
+  }
+
+  float getLastUnnormalizedWeightSum() const
+  {
+    return lastWeightStats().normalizer;
+  }
+
+  /** Explicitly download the final normalized importance weights for debug consumers. */
+  void downloadImportanceWeightsToHost();
+
+  /** Download exact final-iteration raw costs, including unsafe and nonfinite entries. */
+  std::vector<float> downloadRawRolloutCostsToHost();
+
 protected:
+  /**
+   * Called after a rollout batch only when requiresRawRolloutCostsForIteration() is true. Derived
+   * controllers can capture per-iteration diagnostics before raw costs are replaced by weights.
+   */
+  virtual void optimizationIterationComplete(int iteration)
+  {
+    (void)iteration;
+  }
+
+  /** Whether optimizationIterationComplete needs the raw rollout costs in trajectory_costs_. */
+  virtual bool requiresRawRolloutCostsForIteration() const
+  {
+    return false;
+  }
+
+  /** Device-reduced control before the generic host smoothing/constraint pass. */
+  const control_trajectory& getDeviceOptimalControlSequence() const
+  {
+    return device_optimal_control_;
+  }
+
   void computeStateTrajectory(const Eigen::Ref<const state_array>& x0);
 
   void smoothControlTrajectory();
@@ -74,7 +184,41 @@ protected:
 private:
   // ======== MUST BE OVERWRITTEN =========
   void allocateCUDAMemory();
+  void releaseWeightBuffers() noexcept;
   // ======== END MUST BE OVERWRITTEN =====
+
+  void ensureWeightStatsCapacity(int required_capacity);
+
+  const mppi::kernels::CostWeightStats& lastWeightStats() const
+  {
+    return weight_stats_h_[last_weight_stats_index_];
+  }
+
+  int failed_iteration_ = -1;
+  std::vector<mppi::kernels::CostWeightStats> iteration_weight_stats_;
+  mppi::kernels::CostWeightStats* weight_stats_d_ = nullptr;
+  /** One collision/safety flag per rollout, produced by the rollout cost kernel. */
+  int* rollout_crash_status_d_ = nullptr;
+  float* raw_rollout_costs_d_ = nullptr;
+  bool raw_rollout_costs_valid_ = false;
+  /** Pinned host mirror downloaded once after all optimization iterations complete. */
+  mppi::kernels::CostWeightStats* weight_stats_h_ = nullptr;
+  int weight_stats_capacity_ = 0;
+  int last_weight_stats_index_ = 0;
+  /** Host snapshot of the final device mean before generic host-side post-processing. */
+  control_trajectory device_optimal_control_ = control_trajectory::Zero();
+  std::vector<float> iteration_effective_sample_sizes_;
+  /** Persisted adaptive state to be used by the next control step. */
+  float last_weight_lambda_ = 1.0F;
+  /** Lambda that produced the final iteration's stored weights and statistics. */
+  float last_iteration_weight_lambda_ = 1.0F;
+  float target_ess_ratio_ = 0.2F;
+  float lambda_adaptation_gain_ = 0.1F;
+  float lambda_min_ = 0.01F;
+  float lambda_max_ = 2.0F;
+  float unsafe_rollout_fraction_threshold_ = 0.95F;
+  float cost_normalization_percentile_ = 0.95F;
+  bool lambda_adaptation_enabled_ = false;
 };
 
 #if __CUDACC__

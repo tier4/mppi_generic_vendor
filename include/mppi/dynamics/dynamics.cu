@@ -82,11 +82,19 @@ void Dynamics<CLASS_T, PARAMS_T>::GPUSetup()
 template <class CLASS_T, class PARAMS_T>
 void Dynamics<CLASS_T, PARAMS_T>::freeCudaMem()
 {
-  if (GPUMemStatus_)
+  cudaFreeNoThrow(model_d_);
+  GPUMemStatus_ = false;
+}
+
+template <class CLASS_T, class PARAMS_T>
+__device__ void Dynamics<CLASS_T, PARAMS_T>::initializeDynamics(float* state, float* control, float* output,
+                                                               float* theta_s, float t_0, float dt)
+{
+  // Y workers share one output vector; give each component exactly one writer.
+  // The rollout caller synchronizes after initializing dynamics, sampling, and costs.
+  for (int i = threadIdx.y; i < OUTPUT_DIM && i < STATE_DIM; i += blockDim.y)
   {
-    HANDLE_ERROR(cudaFree(model_d_));
-    GPUMemStatus_ = false;
-    model_d_ = nullptr;
+    output[i] = state[i];
   }
 }
 
@@ -95,12 +103,13 @@ __device__ inline void Dynamics<CLASS_T, PARAMS_T>::computeStateDeriv(float* sta
                                                                       float* theta_s)
 {
   CLASS_T* derived = static_cast<CLASS_T*>(this);
-  // only propagate a single state, i.e. thread.y = 0
-  // find the change in x,y,theta based off of the rest of the state
+  // Kinematics has one writer per rollout (X/Z select the rollout, Y selects its workers).
   if (threadIdx.y == 0)
   {
     derived->computeKinematics(state, state_der);
   }
+  // Keep this dispatch collective: cooperative models can contain block barriers. Serial
+  // implementations must select their writer inside computeDynamics, not around this call.
   derived->computeDynamics(state, control, state_der, theta_s);
 }
 

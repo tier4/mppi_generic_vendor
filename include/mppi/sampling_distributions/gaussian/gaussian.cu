@@ -3,9 +3,12 @@
  **/
 
 #include <mppi/sampling_distributions/gaussian/gaussian.cuh>
+#include <mppi/utils/nvtx.cuh>
 #include <mppi/core/mppi_common.cuh>
 #include <mppi/utils/cuda_math_utils.cuh>
 #include <mppi/utils/math_utils.h>
+
+#include <algorithm>
 
 namespace mppi
 {
@@ -41,6 +44,11 @@ __global__ void setGaussianControls(const float* __restrict__ mean_d, const floa
   shared_std_dev_index = time_specific_std_dev ? shared_std_dev_index : 0;
   global_std_dev_index = time_specific_std_dev ? global_std_dev_index : 0;
   std_dev_size = time_specific_std_dev ? num_timesteps * std_dev_size : std_dev_size;
+  // Time-independent variance uses a single shared slot across Y/Z. Time-dependent slots
+  // have distinct Y/Z owners; X workers partition the control components in either case.
+  const bool load_std_dev = time_specific_std_dev
+                                ? time_index < num_timesteps && distribution_index < num_distributions
+                                : threadIdx.y == 0 && threadIdx.z == 0;
 
   // local variables
   int i, j, k;
@@ -79,11 +87,14 @@ __global__ void setGaussianControls(const float* __restrict__ mean_d, const floa
     }
 
     // Step 2: load std_dev to shared memory
-    const float4* std_dev_d4 = reinterpret_cast<const float4*>(&std_dev_d[global_std_dev_index]);
     float4* std_dev_shared4 = reinterpret_cast<float4*>(&std_dev_shared[shared_std_dev_index]);
-    for (i = threadIdx.x; i < control_dim / 4; i += blockDim.x)
+    if (load_std_dev)
     {
-      std_dev_shared4[i] = std_dev_decay * std_dev_d4[i];
+      const float4* std_dev_d4 = reinterpret_cast<const float4*>(&std_dev_d[global_std_dev_index]);
+      for (i = threadIdx.x; i < control_dim / 4; i += blockDim.x)
+      {
+        std_dev_shared4[i] = std_dev_decay * std_dev_d4[i];
+      }
     }
 
     // Step 3: load noise into shared memory
@@ -144,11 +155,14 @@ __global__ void setGaussianControls(const float* __restrict__ mean_d, const floa
     }
 
     // Step 2: load std_dev to shared memory
-    const float2* std_dev_d2 = reinterpret_cast<const float2*>(&std_dev_d[global_std_dev_index]);
     float2* std_dev_shared2 = reinterpret_cast<float2*>(&std_dev_shared[shared_std_dev_index]);
-    for (i = threadIdx.x; i < control_dim / 2; i += blockDim.x)
+    if (load_std_dev)
     {
-      std_dev_shared2[i] = std_dev_decay * std_dev_d2[i];
+      const float2* std_dev_d2 = reinterpret_cast<const float2*>(&std_dev_d[global_std_dev_index]);
+      for (i = threadIdx.x; i < control_dim / 2; i += blockDim.x)
+      {
+        std_dev_shared2[i] = std_dev_decay * std_dev_d2[i];
+      }
     }
 
     // Step 3: load noise into shared memory
@@ -218,7 +232,7 @@ __global__ void setGaussianControls(const float* __restrict__ mean_d, const floa
     // __syncthreads();
 
     // Step 2: load std_dev to shared memory
-    for (i = threadIdx.x; i < control_dim; i += blockDim.x)
+    for (i = threadIdx.x; load_std_dev && i < control_dim; i += blockDim.x)
     {
       std_dev_shared[shared_std_dev_index + i] = std_dev_decay * std_dev_d[global_std_dev_index + i];
     }
@@ -296,16 +310,20 @@ __host__ void GAUSSIAN_CLASS::allocateCUDAMemoryHelper()
     {
 #if defined(CUDART_VERSION) && CUDART_VERSION > 11200
       HANDLE_ERROR(cudaFreeAsync(std_dev_d_, this->stream_));
+      std_dev_d_ = nullptr;
 #else
       HANDLE_ERROR(cudaFree(std_dev_d_));
+      std_dev_d_ = nullptr;
 #endif
     }
     if (control_means_d_)
     {  // deallocate previous memory control trajectory means
 #if defined(CUDART_VERSION) && CUDART_VERSION > 11200
       HANDLE_ERROR(cudaFreeAsync(control_means_d_, this->stream_));
+      control_means_d_ = nullptr;
 #else
       HANDLE_ERROR(cudaFree(control_means_d_));
+      control_means_d_ = nullptr;
 #endif
     }
 
@@ -324,7 +342,10 @@ __host__ void GAUSSIAN_CLASS::allocateCUDAMemoryHelper()
     HANDLE_ERROR(cudaMalloc((void**)&control_means_d_,
                             sizeof(float) * this->getNumDistributions() * this->getNumTimesteps() * CONTROL_DIM));
 #endif
-    means_.resize(this->getNumDistributions() * this->getNumTimesteps() * CONTROL_DIM);
+    const std::size_t control_mean_count =
+        static_cast<std::size_t>(this->getNumDistributions()) * this->getNumTimesteps() * CONTROL_DIM;
+    pinned_control_means_.resize(control_mean_count);
+    means_.resize(control_mean_count);
     // Ensure that the device side point knows where the the standard deviation memory is located
     HANDLE_ERROR(cudaMemcpyAsync(&this->sampling_d_->std_dev_d_, &std_dev_d_, sizeof(float*), cudaMemcpyHostToDevice,
                                  this->stream_));
@@ -337,12 +358,11 @@ GAUSSIAN_TEMPLATE
 __host__ void GAUSSIAN_CLASS::freeCudaMem()
 {
   if (this->GPUMemStatus_)
-  {
-    HANDLE_ERROR(cudaFree(control_means_d_));
-    HANDLE_ERROR(cudaFree(std_dev_d_));
-    control_means_d_ = nullptr;
-    std_dev_d_ = nullptr;
-  }
+    gpuAssert(cudaStreamSynchronize(this->stream_), __FILE__, __LINE__, false);
+  cudaFreeNoThrow(control_means_d_);
+  cudaFreeNoThrow(std_dev_d_);
+  pinned_control_means_.resetNoThrow();
+  means_.clear();
   PARENT_CLASS::freeCudaMem();
 }
 
@@ -442,21 +462,20 @@ __host__ void GAUSSIAN_CLASS::updateDistributionParamsFromDevice(const float* tr
         distribution_i, this->getNumDistributions());
     return;
   }
-  float* control_samples_i_d =
-      &(this->control_samples_d_[distribution_i * this->getNumRollouts() * this->getNumTimesteps() * CONTROL_DIM]);
-  float* control_mean_i_d = &(this->control_means_d_[distribution_i * this->getNumTimesteps() * CONTROL_DIM]);
   if (baseline_and_norm_d != nullptr)
   {
+    float* control_samples_i_d =
+        &(this->control_samples_d_[distribution_i * this->getNumRollouts() * this->getNumTimesteps() * CONTROL_DIM]);
+    float* control_mean_i_d = &(this->control_means_d_[distribution_i * this->getNumTimesteps() * CONTROL_DIM]);
     mppi::kernels::launchWeightedReductionKernel<CONTROL_DIM>(
         trajectory_weights_d, control_samples_i_d, control_mean_i_d, baseline_and_norm_d, distribution_i,
-        this->getNumTimesteps(), this->getNumRollouts(), this->params_.sum_strides, this->stream_, synchronize);
+        this->getNumTimesteps(), this->getNumRollouts(), this->params_.sum_strides, this->stream_, false);
   }
   else
   {
-    mppi::kernels::launchWeightedReductionKernel<CONTROL_DIM>(trajectory_weights_d, control_samples_i_d, control_mean_i_d,
-                                                              normalizer, this->getNumTimesteps(), this->getNumRollouts(),
-                                                              this->params_.sum_strides, this->stream_, synchronize);
+    updateDistributionParamsFromDeviceOnly(trajectory_weights_d, normalizer, distribution_i, false);
   }
+  float* control_mean_i_d = &(this->control_means_d_[distribution_i * this->getNumTimesteps() * CONTROL_DIM]);
   HANDLE_ERROR(cudaMemcpyAsync(&means_[distribution_i * this->getNumTimesteps() * CONTROL_DIM], control_mean_i_d,
                                sizeof(float) * this->getNumTimesteps() * CONTROL_DIM, cudaMemcpyDeviceToHost,
                                this->stream_));
@@ -464,6 +483,27 @@ __host__ void GAUSSIAN_CLASS::updateDistributionParamsFromDevice(const float* tr
   {
     HANDLE_ERROR(cudaStreamSynchronize(this->stream_));
   }
+}
+
+GAUSSIAN_TEMPLATE
+__host__ void GAUSSIAN_CLASS::updateDistributionParamsFromDeviceOnly(const float* trajectory_weights_d,
+                                                                     float normalizer,
+                                                                     const int& distribution_i,
+                                                                     bool synchronize)
+{
+  if (distribution_i >= this->getNumDistributions())
+  {
+    this->logger_->error(
+        "Updating distributional params for distribution %d out of %d total. Distribution out of bounds.\n",
+        distribution_i, this->getNumDistributions());
+    return;
+  }
+  float* control_samples_i_d =
+      &(this->control_samples_d_[distribution_i * this->getNumRollouts() * this->getNumTimesteps() * CONTROL_DIM]);
+  float* control_mean_i_d = &(this->control_means_d_[distribution_i * this->getNumTimesteps() * CONTROL_DIM]);
+  mppi::kernels::launchWeightedReductionKernel<CONTROL_DIM>(trajectory_weights_d, control_samples_i_d, control_mean_i_d,
+                                                            normalizer, this->getNumTimesteps(), this->getNumRollouts(),
+                                                            this->params_.sum_strides, this->stream_, synchronize);
 }
 
 GAUSSIAN_TEMPLATE
@@ -478,13 +518,73 @@ __host__ void GAUSSIAN_CLASS::setHostOptimalControlSequence(float* optimal_contr
     return;
   }
 
-  HANDLE_ERROR(cudaMemcpyAsync(
-      optimal_control_trajectory, &(this->control_means_d_[this->getNumTimesteps() * CONTROL_DIM * distribution_i]),
-      sizeof(float) * this->getNumTimesteps() * CONTROL_DIM, cudaMemcpyDeviceToHost, this->stream_));
-  if (synchronize)
+  if (!synchronize)
   {
-    HANDLE_ERROR(cudaStreamSynchronize(this->stream_));
+    {
+      mppi::instrumentation::ScopedNvtxRange enqueue_range(
+          "MPPI/final_result_enqueue_control", mppi::instrumentation::NvtxColor::DATA_TRANSFER);
+      HANDLE_ERROR(cudaMemcpyAsync(
+          optimal_control_trajectory,
+          &(this->control_means_d_[this->getNumTimesteps() * CONTROL_DIM * distribution_i]),
+          sizeof(float) * this->getNumTimesteps() * CONTROL_DIM, cudaMemcpyDeviceToHost, this->stream_));
+    }
+    return;
   }
+
+  enqueueOptimalControlSequenceDownload(distribution_i);
+  waitForOptimalControlSequenceDownload();
+  finalizeOptimalControlSequenceDownload(optimal_control_trajectory, distribution_i);
+}
+
+GAUSSIAN_TEMPLATE
+__host__ void GAUSSIAN_CLASS::enqueueOptimalControlSequenceDownload(const int& distribution_i)
+{
+  if (distribution_i >= this->getNumDistributions())
+  {
+    this->logger_->error(
+        "Asking for optimal control sequence from distribution %d out of %d total. Distribution out of bounds.\n",
+        distribution_i, this->getNumDistributions());
+    return;
+  }
+
+  const std::size_t distribution_offset =
+      static_cast<std::size_t>(this->getNumTimesteps()) * CONTROL_DIM * distribution_i;
+  const std::size_t control_count = static_cast<std::size_t>(this->getNumTimesteps()) * CONTROL_DIM;
+  mppi::instrumentation::ScopedNvtxRange enqueue_range(
+      "MPPI/final_result_enqueue_control", mppi::instrumentation::NvtxColor::DATA_TRANSFER);
+  HANDLE_ERROR(cudaMemcpyAsync(pinned_control_means_.data() + distribution_offset,
+                               this->control_means_d_ + distribution_offset, control_count * sizeof(float),
+                               cudaMemcpyDeviceToHost, this->stream_));
+}
+
+GAUSSIAN_TEMPLATE
+__host__ void GAUSSIAN_CLASS::waitForOptimalControlSequenceDownload()
+{
+  mppi::instrumentation::ScopedNvtxRange wait_range(
+      "MPPI/final_result_wait", mppi::instrumentation::NvtxColor::DATA_TRANSFER);
+  HANDLE_ERROR(cudaStreamSynchronize(this->stream_));
+}
+
+GAUSSIAN_TEMPLATE
+__host__ void GAUSSIAN_CLASS::finalizeOptimalControlSequenceDownload(float* optimal_control_trajectory,
+                                                                    const int& distribution_i)
+{
+  if (distribution_i >= this->getNumDistributions())
+  {
+    this->logger_->error(
+        "Asking for optimal control sequence from distribution %d out of %d total. Distribution out of bounds.\n",
+        distribution_i, this->getNumDistributions());
+    return;
+  }
+
+  const std::size_t distribution_offset =
+      static_cast<std::size_t>(this->getNumTimesteps()) * CONTROL_DIM * distribution_i;
+  const std::size_t control_count = static_cast<std::size_t>(this->getNumTimesteps()) * CONTROL_DIM;
+  const float* staged_control = pinned_control_means_.data() + distribution_offset;
+  mppi::instrumentation::ScopedNvtxRange host_copy_range(
+      "MPPI/final_result_host_copy", mppi::instrumentation::NvtxColor::DATA_TRANSFER);
+  std::copy_n(staged_control, control_count, optimal_control_trajectory);
+  std::copy_n(staged_control, control_count, means_.data() + distribution_offset);
 }
 
 GAUSSIAN_TEMPLATE
