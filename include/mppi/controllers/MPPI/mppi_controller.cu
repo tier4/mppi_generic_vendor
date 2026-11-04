@@ -298,7 +298,7 @@ void VanillaMPPI::computeControl(const Eigen::Ref<const state_array>& state, int
             this->model_, this->cost_, this->sampler_, this->getDt(), this->getNumTimesteps(), NUM_ROLLOUTS,
             this->getLambda(), this->getAlpha(), this->initial_state_d_, this->output_d_, this->trajectory_costs_d_,
             this->params_.dynamics_rollout_dim_, this->params_.cost_rollout_dim_, this->stream_, false,
-            rollout_crash_status_d_);
+            rollout_crash_status_d_, /*record_phases=*/true);
       }
       else if (this->getKernelChoiceAsEnum() == kernelType::USE_SINGLE_KERNEL)
       {

@@ -3,6 +3,7 @@
 #include <mppi/utils/gpu_err_chk.cuh>
 #include <mppi/utils/math_utils.h>
 #include <mppi/utils/cuda_math_utils.cuh>
+#include <mppi/utils/nvtx.cuh>
 
 #include <cfloat>
 #include <type_traits>
@@ -1610,7 +1611,7 @@ void launchSplitRolloutKernel(DYN_T* __restrict__ dynamics, COST_T* __restrict__
                               const int num_rollouts, float lambda, float alpha, float* __restrict__ init_x_d,
                               float* __restrict__ y_d, float* __restrict__ trajectory_costs, dim3 dimDynBlock,
                               dim3 dimCostBlock, cudaStream_t stream, bool synchronize,
-                              int* __restrict__ rollout_crash_status_d)
+                              int* __restrict__ rollout_crash_status_d, bool record_phases)
 {
   if (dimDynBlock.x == 0 || num_rollouts % dimDynBlock.x != 0)
   {
@@ -1624,22 +1625,44 @@ void launchSplitRolloutKernel(DYN_T* __restrict__ dynamics, COST_T* __restrict__
               << ") must be greater than or equal to cost block size x (" << dimCostBlock.x << ")" << std::endl;
     throw std::invalid_argument("Invalid MPPI rollout launch dimensions");
   }
-  // Run Dynamics
-  const int gridsize_x = math::int_ceil(num_rollouts, dimDynBlock.x);
-  dim3 dimGrid(gridsize_x, 1, 1);
-  unsigned dynamics_shared_size = calcRolloutDynamicsKernelSharedMemSize(dynamics, sampling, dimDynBlock);
-  HANDLE_ERROR(cudaFuncSetAttribute(rolloutDynamicsKernel<DYN_T, SAMPLING_T>,
-                                    cudaFuncAttributeMaxDynamicSharedMemorySize, dynamics_shared_size));
-  rolloutDynamicsKernel<DYN_T, SAMPLING_T><<<dimGrid, dimDynBlock, dynamics_shared_size, stream>>>(
-      dynamics->model_d_, sampling->sampling_d_, dt, num_timesteps, num_rollouts, init_x_d, y_d);
-  HANDLE_ERROR(cudaGetLastError());
-  // Run Costs
-  dim3 dimCostGrid(num_rollouts, 1, 1);
-  unsigned cost_shared_size = calcRolloutCostKernelSharedMemSize(costs, sampling, dimCostBlock);
-  rolloutCostKernel<COST_T, SAMPLING_T, COALESCE><<<dimCostGrid, dimCostBlock, cost_shared_size, stream>>>(
-      costs->cost_d_, sampling->sampling_d_, dt, num_timesteps, num_rollouts, lambda, alpha, y_d,
-      trajectory_costs, rollout_crash_status_d);
-  HANDLE_ERROR(cudaGetLastError());
+  const auto launch_dynamics = [&]() {
+    const int gridsize_x = math::int_ceil(num_rollouts, dimDynBlock.x);
+    dim3 dimGrid(gridsize_x, 1, 1);
+    unsigned dynamics_shared_size = calcRolloutDynamicsKernelSharedMemSize(dynamics, sampling, dimDynBlock);
+    HANDLE_ERROR(cudaFuncSetAttribute(rolloutDynamicsKernel<DYN_T, SAMPLING_T>,
+                                      cudaFuncAttributeMaxDynamicSharedMemorySize, dynamics_shared_size));
+    rolloutDynamicsKernel<DYN_T, SAMPLING_T><<<dimGrid, dimDynBlock, dynamics_shared_size, stream>>>(
+        dynamics->model_d_, sampling->sampling_d_, dt, num_timesteps, num_rollouts, init_x_d, y_d);
+    HANDLE_ERROR(cudaGetLastError());
+  };
+  const auto launch_cost = [&]() {
+    dim3 dimCostGrid(num_rollouts, 1, 1);
+    unsigned cost_shared_size = calcRolloutCostKernelSharedMemSize(costs, sampling, dimCostBlock);
+    rolloutCostKernel<COST_T, SAMPLING_T, COALESCE><<<dimCostGrid, dimCostBlock, cost_shared_size, stream>>>(
+        costs->cost_d_, sampling->sampling_d_, dt, num_timesteps, num_rollouts, lambda, alpha, y_d, trajectory_costs,
+        rollout_crash_status_d);
+    HANDLE_ERROR(cudaGetLastError());
+  };
+  // Nested ranges use the launch stream and end before the optional completion wait. Keeping
+  // them opt-in also excludes startup kernel-selection trials from optimizer iteration counts.
+  if (record_phases)
+  {
+    {
+      mppi::instrumentation::ScopedNvtxRange range("MPPI/rollout_dynamics", mppi::instrumentation::NvtxColor::ROLLOUT,
+                                                   stream);
+      launch_dynamics();
+    }
+    {
+      mppi::instrumentation::ScopedNvtxRange range("MPPI/rollout_cost", mppi::instrumentation::NvtxColor::ROLLOUT,
+                                                   stream);
+      launch_cost();
+    }
+  }
+  else
+  {
+    launch_dynamics();
+    launch_cost();
+  }
   if (synchronize)
   {
     HANDLE_ERROR(cudaStreamSynchronize(stream));

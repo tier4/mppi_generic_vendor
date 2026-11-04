@@ -246,13 +246,14 @@ __device__ void rolloutWeightReductionAndSaveControl(int thread_idx, int block_i
 /**
  * Launch Kernel Methods
  **/
+/** Enable record_phases for optimizer iterations, leaving kernel-selection trials uninstrumented. */
 template <class DYN_T, class COST_T, typename SAMPLING_T, bool COALESCE = true>
 void launchSplitRolloutKernel(DYN_T* __restrict__ dynamics, COST_T* __restrict__ costs,
                               SAMPLING_T* __restrict__ sampling, float dt, const int num_timesteps,
                               const int num_rollouts, float lambda, float alpha, float* __restrict__ init_x_d,
                               float* __restrict__ y_d, float* __restrict__ trajectory_costs, dim3 dimDynBlock,
                               dim3 dimCostBlock, cudaStream_t stream, bool synchronize = true,
-                              int* __restrict__ rollout_crash_status_d = nullptr);
+                              int* __restrict__ rollout_crash_status_d = nullptr, bool record_phases = false);
 
 template <class DYN_T, class COST_T, typename SAMPLING_T>
 void launchRolloutKernel(DYN_T* __restrict__ dynamics, COST_T* __restrict__ costs, SAMPLING_T* __restrict__ sampling,
