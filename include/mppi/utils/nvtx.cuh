@@ -5,6 +5,7 @@
 
 #include <nvtx3/nvToolsExt.h>
 #include <cuda_runtime_api.h>
+#include <mppi/utils/performance_recorder.cuh>
 
 #include <cstdint>
 
@@ -30,6 +31,20 @@ class ScopedNvtxRange
 {
 public:
   __host__ explicit ScopedNvtxRange(const char* name, const NvtxColor color) noexcept
+    : performance_(name, false, nullptr)
+  {
+    push(name, color);
+  }
+
+  /** Also time queued device work on this exact stream when a recorder is active. */
+  __host__ ScopedNvtxRange(const char* name, const NvtxColor color, cudaStream_t stream) noexcept
+    : performance_(name, true, stream)
+  {
+    push(name, color);
+  }
+
+private:
+  __host__ static void push(const char* name, const NvtxColor color) noexcept
   {
     nvtxEventAttributes_t attributes{};
     attributes.version = NVTX_VERSION;
@@ -41,6 +56,7 @@ public:
     nvtxRangePushEx(&attributes);
   }
 
+public:
   __host__ ~ScopedNvtxRange() noexcept
   {
     nvtxRangePop();
@@ -50,6 +66,9 @@ public:
   ScopedNvtxRange& operator=(const ScopedNvtxRange&) = delete;
   ScopedNvtxRange(ScopedNvtxRange&&) = delete;
   ScopedNvtxRange& operator=(ScopedNvtxRange&&) = delete;
+
+private:
+  ScopedPerformanceRange performance_;
 };
 
 }  // namespace instrumentation

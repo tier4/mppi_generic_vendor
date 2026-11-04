@@ -16,18 +16,7 @@ void assert_float_rel_near(const float known, const float compute, float rel_err
 
 TEST(cuFFT, checkErrorCode)
 {
-  cufftHandle plan;
-  cuComplex* input_d;
-  float* output_d;
-  // As this call is intended to cause issues, disable compiler warning
-  // src: https://stackoverflow.com/questions/14831051/how-to-disable-a-specific-nvcc-compiler-warnings
-  // https://stackoverflow.com/questions/56193080/how-do-i-apply-a-flag-setting-nvcc-pragma-to-only-a-few-lines-of-code
-  // https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#nv-diagnostic-pragmas
-#pragma push
-#pragma diag_suppress = used_before_set
-  auto status = cufftExecC2R(plan, input_d, output_d);
-#pragma pop
-  std::string error_string = cufftGetErrorString(status);
+  const std::string error_string = cufftGetErrorString(CUFFT_INVALID_PLAN);
   // std::cout << error_string << std::endl;
   EXPECT_TRUE(error_string == "cuFFT was passed an invalid plan handle");
 }
@@ -56,9 +45,9 @@ public:
   using SAMPLER_T = mppi::sampling_distributions::ColoredNoiseDistribution<DYN_PARAMS_T>;
   using SAMPLER_PARAMS_T = typename SAMPLER_T::SAMPLING_PARAMS_T;
 
-  SAMPLER_T* sampler;
-  cudaStream_t stream;
-  curandGenerator_t* gen;
+  SAMPLER_T* sampler{ nullptr };
+  cudaStream_t stream{ nullptr };
+  curandGenerator_t* gen{ nullptr };
 
 protected:
   void SetUp() override
@@ -73,20 +62,22 @@ protected:
     params.pure_noise_trajectories_percentage = 0.0;
     params.offset_decay_rate = 0.0;
 
-    cudaStreamCreate(&stream);
+    HANDLE_ERROR(cudaStreamCreate(&stream));
     gen = new curandGenerator_t();
-    curandCreateGenerator(gen, CURAND_RNG_PSEUDO_DEFAULT);
-    curandSetPseudoRandomGeneratorSeed(*gen, 42);
-    curandSetGeneratorOffset(*gen, 0);
-    curandSetStream(*gen, stream);
+    HANDLE_CURAND_ERROR(curandCreateGenerator(gen, CURAND_RNG_PSEUDO_DEFAULT));
+    HANDLE_CURAND_ERROR(curandSetPseudoRandomGeneratorSeed(*gen, 42));
+    HANDLE_CURAND_ERROR(curandSetGeneratorOffset(*gen, 0));
+    HANDLE_CURAND_ERROR(curandSetStream(*gen, stream));
     sampler = new SAMPLER_T(params, stream);
     sampler->GPUSetup();
   }
 
   void TearDown() override
   {
+    if (gen && *gen) HANDLE_CURAND_ERROR(curandDestroyGenerator(*gen));
     delete gen;
     delete sampler;
+    if (stream) HANDLE_ERROR(cudaStreamDestroy(stream));
   }
 };
 

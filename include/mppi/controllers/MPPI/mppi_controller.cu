@@ -244,8 +244,12 @@ void VanillaMPPI::computeControl(const Eigen::Ref<const state_array>& state, int
   ensureWeightStatsCapacity(std::max(1, num_iterations));
 
   // Send the initial condition to the device
-  HANDLE_ERROR(cudaMemcpyAsync(this->initial_state_d_, state.data(), DYN_T::STATE_DIM * sizeof(float),
-                               cudaMemcpyHostToDevice, this->stream_));
+  {
+    mppi::instrumentation::ScopedNvtxRange range("MPPI/initial_state_upload",
+                                                 mppi::instrumentation::NvtxColor::DATA_TRANSFER, this->stream_);
+    HANDLE_ERROR(cudaMemcpyAsync(this->initial_state_d_, state.data(), DYN_T::STATE_DIM * sizeof(float),
+                                 cudaMemcpyHostToDevice, this->stream_));
+  }
 
   const float rollout_count = std::max(static_cast<float>(NUM_ROLLOUTS), 1.0F);
   float baseline_prev = std::isfinite(this->free_energy_statistics_.real_sys.previousBaseline) ?
@@ -270,6 +274,8 @@ void VanillaMPPI::computeControl(const Eigen::Ref<const state_array>& state, int
   // consumes the control mean produced by the preceding device reduction.
   if (num_iterations > 0)
   {
+    mppi::instrumentation::ScopedNvtxRange range("MPPI/nominal_control_upload",
+                                                 mppi::instrumentation::NvtxColor::DATA_TRANSFER, this->stream_);
     this->copyNominalControlToDevice(false);
   }
 
@@ -277,13 +283,15 @@ void VanillaMPPI::computeControl(const Eigen::Ref<const state_array>& state, int
   {
     // Generate noise data
     {
-      mppi::instrumentation::ScopedNvtxRange range("MPPI/random_sampling", mppi::instrumentation::NvtxColor::SAMPLING);
+      mppi::instrumentation::ScopedNvtxRange range("MPPI/random_sampling", mppi::instrumentation::NvtxColor::SAMPLING,
+                                                   this->stream_);
       this->sampler_->generateSamples(optimization_stride, opt_iter, this->gen_, false);
     }
 
     // Launch the rollout kernel
     {
-      mppi::instrumentation::ScopedNvtxRange range("MPPI/rollout", mppi::instrumentation::NvtxColor::ROLLOUT);
+      mppi::instrumentation::ScopedNvtxRange range("MPPI/rollout", mppi::instrumentation::NvtxColor::ROLLOUT,
+                                                   this->stream_);
       if (this->getKernelChoiceAsEnum() == kernelType::USE_SPLIT_KERNELS)
       {
         mppi::kernels::launchSplitRolloutKernel<DYN_T, COST_T, SAMPLING_T>(
@@ -323,7 +331,7 @@ void VanillaMPPI::computeControl(const Eigen::Ref<const state_array>& state, int
     // ESS, and safety statistics. The per-iteration records remain on-device until the loop ends.
     {
       mppi::instrumentation::ScopedNvtxRange range("MPPI/weight_statistics",
-                                                   mppi::instrumentation::NvtxColor::STATISTICS);
+                                                   mppi::instrumentation::NvtxColor::STATISTICS, this->stream_);
       mppi::kernels::launchMinMaxWeightKernel(NUM_ROLLOUTS, this->getNormExpThreads(), this->trajectory_costs_d_,
                                               rollout_crash_status_d_, 1.0F / last_iteration_weight_lambda_,
                                               cost_normalization_percentile_, 1.0E-6F, weight_stats_d_ + opt_iter,
@@ -334,7 +342,7 @@ void VanillaMPPI::computeControl(const Eigen::Ref<const state_array>& state, int
 
     {
       mppi::instrumentation::ScopedNvtxRange range("MPPI/weighted_control_reduction",
-                                                   mppi::instrumentation::NvtxColor::REDUCTION);
+                                                   mppi::instrumentation::NvtxColor::REDUCTION, this->stream_);
       this->sampler_->updateDistributionParamsFromDeviceOnly(this->trajectory_costs_d_, 1.0F, 0, false);
     }
   }
@@ -348,7 +356,7 @@ void VanillaMPPI::computeControl(const Eigen::Ref<const state_array>& state, int
     // explicit per-iteration raw-rollout diagnostics are enabled.
     {
       mppi::instrumentation::ScopedNvtxRange enqueue_range(
-          "MPPI/final_result_enqueue_weight_stats", mppi::instrumentation::NvtxColor::DATA_TRANSFER);
+          "MPPI/final_result_enqueue_weight_stats", mppi::instrumentation::NvtxColor::DATA_TRANSFER, this->stream_);
       HANDLE_ERROR(cudaMemcpyAsync(weight_stats_h_, weight_stats_d_,
                                    static_cast<std::size_t>(num_iterations) * sizeof(*weight_stats_h_),
                                    cudaMemcpyDeviceToHost, this->stream_));
@@ -507,6 +515,7 @@ void VanillaMPPI::ensureWeightStatsCapacity(int required_capacity)
 VANILLA_MPPI_TEMPLATE
 void VanillaMPPI::computeStateTrajectory(const Eigen::Ref<const state_array>& x0)
 {
+  mppi::instrumentation::ScopedNvtxRange range("MPPI/host_state_replay", mppi::instrumentation::NvtxColor::ROLLOUT);
   this->computeOutputTrajectoryHelper(this->output_, this->state_, x0, this->control_);
 }
 

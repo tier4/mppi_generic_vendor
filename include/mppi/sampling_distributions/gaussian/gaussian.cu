@@ -522,7 +522,7 @@ __host__ void GAUSSIAN_CLASS::setHostOptimalControlSequence(float* optimal_contr
   {
     {
       mppi::instrumentation::ScopedNvtxRange enqueue_range(
-          "MPPI/final_result_enqueue_control", mppi::instrumentation::NvtxColor::DATA_TRANSFER);
+          "MPPI/final_result_enqueue_control", mppi::instrumentation::NvtxColor::DATA_TRANSFER, this->stream_);
       HANDLE_ERROR(cudaMemcpyAsync(
           optimal_control_trajectory,
           &(this->control_means_d_[this->getNumTimesteps() * CONTROL_DIM * distribution_i]),
@@ -550,8 +550,8 @@ __host__ void GAUSSIAN_CLASS::enqueueOptimalControlSequenceDownload(const int& d
   const std::size_t distribution_offset =
       static_cast<std::size_t>(this->getNumTimesteps()) * CONTROL_DIM * distribution_i;
   const std::size_t control_count = static_cast<std::size_t>(this->getNumTimesteps()) * CONTROL_DIM;
-  mppi::instrumentation::ScopedNvtxRange enqueue_range(
-      "MPPI/final_result_enqueue_control", mppi::instrumentation::NvtxColor::DATA_TRANSFER);
+  mppi::instrumentation::ScopedNvtxRange enqueue_range("MPPI/final_result_enqueue_control",
+                                                       mppi::instrumentation::NvtxColor::DATA_TRANSFER, this->stream_);
   HANDLE_ERROR(cudaMemcpyAsync(pinned_control_means_.data() + distribution_offset,
                                this->control_means_d_ + distribution_offset, control_count * sizeof(float),
                                cudaMemcpyDeviceToHost, this->stream_));
