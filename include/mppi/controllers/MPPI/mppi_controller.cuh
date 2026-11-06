@@ -79,6 +79,17 @@ public:
 
   void chooseAppropriateKernel() override;
 
+  /** Host-side comparison switch for split rollouts; configure outside computeControl. */
+  void setCooperativeDynamicsOutputStores(bool enabled)
+  {
+    cooperative_dynamics_output_stores_ = enabled;
+  }
+
+  bool getCooperativeDynamicsOutputStores() const
+  {
+    return cooperative_dynamics_output_stores_;
+  }
+
   /** Configure robust weighting, the ESS target, and bounded temperature feedback. */
   void configureEssLambdaAdaptation(float target_ess_ratio, float adaptation_gain,
                                     float lambda_min, float lambda_max,
@@ -182,6 +193,7 @@ protected:
   void smoothControlTrajectory();
 
 private:
+  bool cooperative_dynamics_output_stores_ = true;
   // ======== MUST BE OVERWRITTEN =========
   void allocateCUDAMemory();
   void releaseWeightBuffers() noexcept;

@@ -60,7 +60,7 @@ __global__ void rolloutKernel(DYN_T* __restrict__ dynamics, SAMPLING_T* __restri
                               float* __restrict__ trajectory_costs_d,
                               int* __restrict__ rollout_crash_status_d);
 
-template <class DYN_T, class SAMPLING_T>
+template <class DYN_T, class SAMPLING_T, bool COOPERATIVE_OUTPUT = true>
 __global__ void rolloutDynamicsKernel(DYN_T* __restrict__ dynamics, SAMPLING_T* __restrict__ sampling, float dt,
                                       const int num_timesteps, const int num_rollouts,
                                       const float* __restrict__ init_x_d, float* __restrict__ y_d);
@@ -253,7 +253,8 @@ void launchSplitRolloutKernel(DYN_T* __restrict__ dynamics, COST_T* __restrict__
                               const int num_rollouts, float lambda, float alpha, float* __restrict__ init_x_d,
                               float* __restrict__ y_d, float* __restrict__ trajectory_costs, dim3 dimDynBlock,
                               dim3 dimCostBlock, cudaStream_t stream, bool synchronize = true,
-                              int* __restrict__ rollout_crash_status_d = nullptr, bool record_phases = false);
+                              int* __restrict__ rollout_crash_status_d = nullptr, bool record_phases = false,
+                              bool cooperative_output = true);
 
 template <class DYN_T, class COST_T, typename SAMPLING_T>
 void launchRolloutKernel(DYN_T* __restrict__ dynamics, COST_T* __restrict__ costs, SAMPLING_T* __restrict__ sampling,

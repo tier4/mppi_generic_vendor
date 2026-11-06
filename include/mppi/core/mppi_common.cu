@@ -36,6 +36,34 @@ namespace kernels
 {
 namespace detail
 {
+/**
+ * Copy a shared [distribution][rollout][component] tile to the current global timestep.
+ * All X/Y workers of each Z distribution participate. The caller must publish the tile
+ * before this copy and synchronize the whole block before reusing shared output storage.
+ * Like rolloutDynamicsKernel, this requires complete X tiles (num_rollouts % blockDim.x == 0).
+ */
+template <int OUTPUT_DIM>
+__device__ __forceinline__ void storeRolloutOutputs(float* __restrict__ outputs,
+                                                    const float* __restrict__ shared_outputs, const int num_rollouts,
+                                                    const int num_timesteps, const int timestep)
+{
+  static_assert(OUTPUT_DIM > 0, "Rollout outputs must have at least one component");
+  const int worker = threadIdx.y * blockDim.x + threadIdx.x;
+  const int workers = blockDim.x * blockDim.y;
+  const int tile_size = blockDim.x * OUTPUT_DIM;
+  const int first_rollout = threadIdx.z * num_rollouts + blockIdx.x * blockDim.x;
+  const float* tile = shared_outputs + threadIdx.z * tile_size;
+  float* destination = outputs + (first_rollout * num_timesteps + timestep) * OUTPUT_DIM;
+  // Adjacent lanes copy adjacent components, rather than the same component of
+  // distant trajectories. Scalar copies also support odd dimensions and unaligned rows.
+  for (int i = worker; i < tile_size; i += workers)
+  {
+    const int rollout = i / OUTPUT_DIM;
+    const int component = i % OUTPUT_DIM;
+    destination[rollout * num_timesteps * OUTPUT_DIM + component] = tile[i];
+  }
+}
+
 template <class COST_T>
 __device__ __forceinline__ void initializeCostObject(
     const COST_T* costs, float* y, float* u, float* theta_c, float dt, std::true_type)
@@ -337,7 +365,7 @@ __global__ void rolloutCostKernel(const COST_T* __restrict__ costs, SAMPLING_T* 
   }
 }
 
-template <class DYN_T, class SAMPLING_T>
+template <class DYN_T, class SAMPLING_T, bool COOPERATIVE_OUTPUT>
 __global__ void rolloutDynamicsKernel(DYN_T* __restrict__ dynamics, SAMPLING_T* __restrict__ sampling, float dt,
                                       const int num_timesteps, const int num_rollouts,
                                       const float* __restrict__ init_x_d, float* __restrict__ y_d)
@@ -404,14 +432,23 @@ __global__ void rolloutDynamicsKernel(DYN_T* __restrict__ dynamics, SAMPLING_T* 
 
     // Increment states
     dynamics->step(x, x_next, xdot, u, y, theta_s_shared, t, dt);
-    // Publish all shared outputs before the Y workers cooperatively read them below.
+    // Publish all shared outputs before the X/Y workers cooperatively read them below.
     __syncthreads();
     x_temp = x;
     x = x_next;
     x_next = x_temp;
-    // Copy state to global memory
-    int sample_time_offset = (num_rollouts * thread_idz + global_idx) * num_timesteps + t;
-    mp1::loadArrayParallel<DYN_T::OUTPUT_DIM>(y_d, sample_time_offset * DYN_T::OUTPUT_DIM, y, 0);
+    // Keep the consumer's [distribution][rollout][time][component] layout unchanged.
+    if (!COOPERATIVE_OUTPUT || DYN_T::OUTPUT_DIM % 2 == 0)
+    {
+      // The false specialization supplies the comparison baseline. Also retain this
+      // vectorized path for even-sized outputs, not yet profiled for other vendor models.
+      const int sample_time_offset = (num_rollouts * thread_idz + global_idx) * num_timesteps + t;
+      mp1::loadArrayParallel<DYN_T::OUTPUT_DIM>(y_d, sample_time_offset * DYN_T::OUTPUT_DIM, y, 0);
+    }
+    else
+    {
+      detail::storeRolloutOutputs<DYN_T::OUTPUT_DIM>(y_d, y_shared, num_rollouts, num_timesteps, t);
+    }
     // Finish every read of y before a worker can reuse shared storage in the next step.
     __syncthreads();
   }
@@ -1611,7 +1648,7 @@ void launchSplitRolloutKernel(DYN_T* __restrict__ dynamics, COST_T* __restrict__
                               const int num_rollouts, float lambda, float alpha, float* __restrict__ init_x_d,
                               float* __restrict__ y_d, float* __restrict__ trajectory_costs, dim3 dimDynBlock,
                               dim3 dimCostBlock, cudaStream_t stream, bool synchronize,
-                              int* __restrict__ rollout_crash_status_d, bool record_phases)
+                              int* __restrict__ rollout_crash_status_d, bool record_phases, bool cooperative_output)
 {
   if (dimDynBlock.x == 0 || num_rollouts % dimDynBlock.x != 0)
   {
@@ -1629,10 +1666,21 @@ void launchSplitRolloutKernel(DYN_T* __restrict__ dynamics, COST_T* __restrict__
     const int gridsize_x = math::int_ceil(num_rollouts, dimDynBlock.x);
     dim3 dimGrid(gridsize_x, 1, 1);
     unsigned dynamics_shared_size = calcRolloutDynamicsKernelSharedMemSize(dynamics, sampling, dimDynBlock);
-    HANDLE_ERROR(cudaFuncSetAttribute(rolloutDynamicsKernel<DYN_T, SAMPLING_T>,
-                                      cudaFuncAttributeMaxDynamicSharedMemorySize, dynamics_shared_size));
-    rolloutDynamicsKernel<DYN_T, SAMPLING_T><<<dimGrid, dimDynBlock, dynamics_shared_size, stream>>>(
-        dynamics->model_d_, sampling->sampling_d_, dt, num_timesteps, num_rollouts, init_x_d, y_d);
+    // Select a specialization on the host: no runtime branch in the timestep loop.
+    if (cooperative_output)
+    {
+      HANDLE_ERROR(cudaFuncSetAttribute(rolloutDynamicsKernel<DYN_T, SAMPLING_T, true>,
+                                        cudaFuncAttributeMaxDynamicSharedMemorySize, dynamics_shared_size));
+      rolloutDynamicsKernel<DYN_T, SAMPLING_T, true><<<dimGrid, dimDynBlock, dynamics_shared_size, stream>>>(
+          dynamics->model_d_, sampling->sampling_d_, dt, num_timesteps, num_rollouts, init_x_d, y_d);
+    }
+    else
+    {
+      HANDLE_ERROR(cudaFuncSetAttribute(rolloutDynamicsKernel<DYN_T, SAMPLING_T, false>,
+                                        cudaFuncAttributeMaxDynamicSharedMemorySize, dynamics_shared_size));
+      rolloutDynamicsKernel<DYN_T, SAMPLING_T, false><<<dimGrid, dimDynBlock, dynamics_shared_size, stream>>>(
+          dynamics->model_d_, sampling->sampling_d_, dt, num_timesteps, num_rollouts, init_x_d, y_d);
+    }
     HANDLE_ERROR(cudaGetLastError());
   };
   const auto launch_cost = [&]() {
