@@ -515,7 +515,7 @@ public:
     }
     else
     {
-      TEMPLATED_FEEDBACK_STATE default_state;
+      TEMPLATED_FEEDBACK_STATE default_state{};
       return default_state;
     }
   };
@@ -528,7 +528,7 @@ public:
     }
     else
     {
-      TEMPLATED_FEEDBACK_PARAMS default_fb_params;
+      TEMPLATED_FEEDBACK_PARAMS default_fb_params{};
       return default_fb_params;
     }
   }

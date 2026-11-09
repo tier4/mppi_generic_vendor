@@ -36,7 +36,6 @@ __global__ void shiftControlTrajectory(float* __restrict__ control_trajectory_d,
 {
   extern __shared__ float shared_mean[];
   const int dist_index = blockIdx.x;
-  const int control_index = threadIdx.x;
 
   mppi::p1::loadArrayParallel<mppi::p1::Parallel1Dir::THREAD_X>(
       shared_mean, 0, control_trajectory_d, dist_index * num_timesteps * control_dim, num_timesteps * control_dim);

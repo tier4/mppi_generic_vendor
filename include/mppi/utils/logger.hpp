@@ -193,6 +193,12 @@ protected:
     std::fprintf(fstream, "%s%s%s", prefix, message.c_str(), suffix);
   }
 
+  // Without formatting arguments, treat the message as literal text, including percent signs.
+  std::string format_string(const char* message)
+  {
+    return std::string(message);
+  }
+
   /**
    * @brief create a string out of format string and variable number of additional arguments
    *

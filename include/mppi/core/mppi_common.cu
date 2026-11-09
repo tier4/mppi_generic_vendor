@@ -40,7 +40,7 @@ namespace detail
  * Copy a shared [distribution][rollout][component] tile to the current global timestep.
  * All X/Y workers of each Z distribution participate. The caller must publish the tile
  * before this copy and synchronize the whole block before reusing shared output storage.
- * Like rolloutDynamicsKernel, this requires complete X tiles (num_rollouts % blockDim.x == 0).
+ * The final X tile may be partial; all workers participate, but only valid rollouts are stored.
  */
 template <int OUTPUT_DIM>
 __device__ __forceinline__ void storeRolloutOutputs(float* __restrict__ outputs,
@@ -51,7 +51,8 @@ __device__ __forceinline__ void storeRolloutOutputs(float* __restrict__ outputs,
   const int worker = threadIdx.y * blockDim.x + threadIdx.x;
   const int workers = blockDim.x * blockDim.y;
   const int tile_size = blockDim.x * OUTPUT_DIM;
-  const int first_rollout = threadIdx.z * num_rollouts + blockIdx.x * blockDim.x;
+  const int tile_first_rollout = blockIdx.x * blockDim.x;
+  const int first_rollout = threadIdx.z * num_rollouts + tile_first_rollout;
   const float* tile = shared_outputs + threadIdx.z * tile_size;
   float* destination = outputs + (first_rollout * num_timesteps + timestep) * OUTPUT_DIM;
   // Adjacent lanes copy adjacent components, rather than the same component of
@@ -60,7 +61,10 @@ __device__ __forceinline__ void storeRolloutOutputs(float* __restrict__ outputs,
   {
     const int rollout = i / OUTPUT_DIM;
     const int component = i % OUTPUT_DIM;
-    destination[rollout * num_timesteps * OUTPUT_DIM + component] = tile[i];
+    if (tile_first_rollout + rollout < num_rollouts)
+    {
+      destination[rollout * num_timesteps * OUTPUT_DIM + component] = tile[i];
+    }
   }
 }
 
@@ -404,9 +408,12 @@ __global__ void rolloutDynamicsKernel(DYN_T* __restrict__ dynamics, SAMPLING_T* 
   float* u = &u_shared[shared_idx * DYN_T::CONTROL_DIM];
   float* y = &y_shared[shared_idx * DYN_T::OUTPUT_DIM];
 
-  // Load global array to shared array
-  loadGlobalToShared<DYN_T::STATE_DIM, DYN_T::CONTROL_DIM>(num_rollouts, blockDim.y, global_idx, thread_idy, thread_idz,
-                                                           init_x_d, x, xdot, u);
+  // Every rollout in a distribution shares the same initial state. Initialize private
+  // scratch for padded X workers too: they must participate in collective dynamics calls.
+  const bool active_rollout = global_idx < num_rollouts;
+  const int initial_idx = min(global_idx, num_rollouts - 1);
+  loadGlobalToShared<DYN_T::STATE_DIM, DYN_T::CONTROL_DIM>(num_rollouts, blockDim.y, initial_idx, thread_idy,
+                                                           thread_idz, init_x_d, x, xdot, u);
   __syncthreads();
 
   /*<----Start of simulation loop-----> */
@@ -418,17 +425,22 @@ __global__ void rolloutDynamicsKernel(DYN_T* __restrict__ dynamics, SAMPLING_T* 
   for (int t = 0; t < num_timesteps; t++)
   {
     // Load noise trajectories scaled by the exploration factor
-    sampling->readControlSample(global_idx, t, distribution_idx, u, theta_d_shared, blockDim.y, thread_idy, y);
+    if (active_rollout)
+    {
+      sampling->readControlSample(global_idx, t, distribution_idx, u, theta_d_shared, blockDim.y, thread_idy, y);
+    }
     // Publish every sampled component before any Y worker clamps the shared control.
     __syncthreads();
 
-    // applies constraints as defined in dynamics.cuh see specific dynamics class for what happens here
-    // usually just control clamping
+    // Constraints and step may contain block barriers, so padded workers also call them.
     dynamics->enforceConstraints(x, u);
     // Publish all constrained components before vector copies and dynamics read u.
     __syncthreads();
-    // Copy control constraints back to global memory
-    sampling->writeControlSample(global_idx, t, distribution_idx, u, theta_d_shared, blockDim.y, thread_idy, y);
+    // Copy control constraints back to global memory only for valid samples.
+    if (active_rollout)
+    {
+      sampling->writeControlSample(global_idx, t, distribution_idx, u, theta_d_shared, blockDim.y, thread_idy, y);
+    }
 
     // Increment states
     dynamics->step(x, x_next, xdot, u, y, theta_s_shared, t, dt);
@@ -442,8 +454,11 @@ __global__ void rolloutDynamicsKernel(DYN_T* __restrict__ dynamics, SAMPLING_T* 
     {
       // The false specialization supplies the comparison baseline. Also retain this
       // vectorized path for even-sized outputs, not yet profiled for other vendor models.
-      const int sample_time_offset = (num_rollouts * thread_idz + global_idx) * num_timesteps + t;
-      mp1::loadArrayParallel<DYN_T::OUTPUT_DIM>(y_d, sample_time_offset * DYN_T::OUTPUT_DIM, y, 0);
+      if (active_rollout)
+      {
+        const int sample_time_offset = (num_rollouts * thread_idz + global_idx) * num_timesteps + t;
+        mp1::loadArrayParallel<DYN_T::OUTPUT_DIM>(y_d, sample_time_offset * DYN_T::OUTPUT_DIM, y, 0);
+      }
     }
     else
     {
@@ -1650,10 +1665,9 @@ void launchSplitRolloutKernel(DYN_T* __restrict__ dynamics, COST_T* __restrict__
                               dim3 dimCostBlock, cudaStream_t stream, bool synchronize,
                               int* __restrict__ rollout_crash_status_d, bool record_phases, bool cooperative_output)
 {
-  if (dimDynBlock.x == 0 || num_rollouts % dimDynBlock.x != 0)
+  if (dimDynBlock.x == 0)
   {
-    std::cerr << __FILE__ << " (" << __LINE__ << "): num_rollouts (" << num_rollouts
-              << ") must be evenly divided by dynamics block size x (" << dimDynBlock.x << ")" << std::endl;
+    std::cerr << __FILE__ << " (" << __LINE__ << "): dynamics block size x must be positive" << std::endl;
     throw std::invalid_argument("Invalid MPPI rollout launch dimensions");
   }
   if (num_timesteps < dimCostBlock.x)
@@ -1663,6 +1677,7 @@ void launchSplitRolloutKernel(DYN_T* __restrict__ dynamics, COST_T* __restrict__
     throw std::invalid_argument("Invalid MPPI rollout launch dimensions");
   }
   const auto launch_dynamics = [&]() {
+    // Round up to cover a partial final X tile; the kernel masks its global accesses.
     const int gridsize_x = math::int_ceil(num_rollouts, dimDynBlock.x);
     dim3 dimGrid(gridsize_x, 1, 1);
     unsigned dynamics_shared_size = calcRolloutDynamicsKernelSharedMemSize(dynamics, sampling, dimDynBlock);
